@@ -1,0 +1,10 @@
+# 비밀·실행 데이터 — 커밋 금지
+.env
+.token_*.json
+state.json
+state.tmp
+trades.csv
+bot.log*
+venv/
+__pycache__/
+.pytest_cache/

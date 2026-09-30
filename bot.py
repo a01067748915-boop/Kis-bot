@@ -14,8 +14,10 @@
   - 종목별 손절, 일일 손실 한도 도달 시 전량 청산 후 당일 중단
   - 목표가보다 너무 위에서는 추격 매수하지 않음
   - 텔레그램 /stop 으로 즉시 전량 청산·정지
+  - 모든 매매는 trades.csv 에 누적 기록
 """
 
+import csv
 import json
 import logging
 import math
@@ -87,6 +89,12 @@ class Telegram:
         self.token, self.chat = token, str(chat_id)
         self.offset = None
         self.enabled = bool(token and chat_id)
+        self.started = time.time()  # 봇 시작 전에 쌓인 명령은 무시
+
+    def _safe(self, e):
+        """오류 메시지에 URL과 함께 섞인 봇 토큰 가리기"""
+        text = str(e)
+        return text.replace(self.token, "***") if self.token else text
 
     def send(self, text):
         log.info("[알림] %s", text.replace("\n", " | "))
@@ -96,7 +104,7 @@ class Telegram:
             requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage",
                           json={"chat_id": self.chat, "text": text}, timeout=10)
         except requests.RequestException as e:
-            log.warning("텔레그램 전송 실패: %s", e)
+            log.warning("텔레그램 전송 실패: %s", self._safe(e))
 
     def commands(self):
         if not self.enabled:
@@ -107,43 +115,66 @@ class Telegram:
                 params["offset"] = self.offset
             data = requests.get(f"https://api.telegram.org/bot{self.token}/getUpdates",
                                 params=params, timeout=10).json()
-        except (requests.RequestException, ValueError):
+        except (requests.RequestException, ValueError) as e:
+            log.warning("텔레그램 명령 조회 실패: %s", self._safe(e))
             return []
         cmds = []
         for u in data.get("result", []):
             self.offset = u["update_id"] + 1
             msg = u.get("message") or {}
             text = (msg.get("text") or "").strip()
+            if msg.get("date", 0) < self.started:  # 재시작 전 명령(/stop 등)이 뒤늦게 실행되지 않게
+                continue
             if text and str(msg.get("chat", {}).get("id")) == self.chat:  # 본인 채팅만
-                cmds.append(text.split()[0].lower())
+                cmds.append(text.split()[0].split("@")[0].lower())  # /stop@봇이름 도 인식
         return cmds
 
 
 # ─── 봇 ───────────────────────────────────────────────
 class Bot:
-    def __init__(self, cfg, api, tg, state_file=HERE / "state.json"):
+    def __init__(self, cfg, api, tg, state_file=HERE / "state.json", journal_file=HERE / "trades.csv"):
         self.cfg, self.api, self.tg = cfg, api, tg
         self.state_file = Path(state_file)
+        self.journal_file = Path(journal_file)
         self.state = self._load()
 
     @staticmethod
     def _fresh(date):
         return {"date": date, "plans": {}, "positions": {}, "traded": [], "realized": 0.0,
-                "halted": False, "paused": False, "closed": False, "skip_day": False,
-                "prepared": False, "trades": []}
+                "halted": False, "paused": False, "liquidate": False, "closed": False,
+                "skip_day": False, "prepared": False, "trades": []}
 
     def _load(self):
         if self.state_file.exists():
             try:
-                return json.loads(self.state_file.read_text())
-            except ValueError:
-                pass
+                saved = json.loads(self.state_file.read_text())
+                return {**self._fresh(saved.get("date", "")), **saved}  # 예전 형식 파일도 빠진 키 보충
+            except (ValueError, AttributeError):
+                log.error("state.json 이 깨져 새로 시작합니다 — 앱에서 보유 종목을 확인하세요")
         return self._fresh("")
 
     def _save(self):
         tmp = self.state_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=1))
         tmp.replace(self.state_file)
+
+    JOURNAL_FIELDS = ["time_et", "date", "env", "dry_run", "sym", "side", "qty", "price", "pnl", "reason"]
+
+    def _record(self, trade):
+        """당일 기록(state) + 누적 기록(trades.csv)"""
+        self.state["trades"].append(trade)
+        self._save()
+        row = {"time_et": datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"), "date": self.state["date"],
+               "env": self.cfg.env, "dry_run": self.cfg.dry_run, **trade}
+        try:
+            new = not self.journal_file.exists()
+            with self.journal_file.open("a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=self.JOURNAL_FIELDS, extrasaction="ignore")
+                if new:
+                    w.writeheader()
+                w.writerow(row)
+        except OSError as e:
+            log.warning("매매 기록 저장 실패: %s", e)
 
     def ex(self, sym):
         return self.cfg.targets.get(sym) or self.state["positions"].get(sym, {}).get("ex", "NAS")
@@ -194,27 +225,38 @@ class Bot:
         ex = self.ex(sym)
         before = self.api.holdings(ex).get(sym, {"qty": 0, "avg": 0.0})
         order_no = self.api.limit_order(side, sym, ex, qty, limit)
+        day = datetime.now(ET).strftime("%Y%m%d")
 
-        def filled_now():
+        def check():
+            """(체결수량, 평균체결가 또는 None) — 주문번호로 체결내역 조회, 안 되면 잔고 변화로 추정"""
+            try:
+                got = self.api.order_fill(order_no, ex, day)
+            except KISError as e:
+                log.warning("%s 체결내역 조회 실패, 잔고로 확인: %s", sym, e)
+                got = None
+            if got is not None:
+                return got
             after = self.api.holdings(ex).get(sym, {"qty": 0, "avg": 0.0})
-            return after, (after["qty"] - before["qty"]) if side == "buy" else (before["qty"] - after["qty"])
+            if side == "buy":
+                n = after["qty"] - before["qty"]
+                avg = (after["avg"] * after["qty"] - before["avg"] * before["qty"]) / n if n > 0 else None
+                return n, avg
+            return before["qty"] - after["qty"], None
 
-        waited, after, filled = 0, before, 0
+        waited, filled, price = 0, 0, None
         while waited < self.cfg.fill_wait_sec:
             time.sleep(3)
             waited += 3
-            after, filled = filled_now()
+            filled, price = check()
             if filled >= qty:
                 break
         if filled < qty:
-            self.api.cancel(sym, ex, order_no, qty)
+            self.api.cancel(sym, ex, order_no, qty - max(0, filled))  # 미체결 잔량만 취소
             time.sleep(2)
-            after, filled = filled_now()
+            filled, price = check()
         filled = max(0, min(filled, qty))
-        if side == "buy" and filled > 0:
-            price = (after["avg"] * after["qty"] - before["avg"] * before["qty"]) / filled
-        else:
-            price = ref_price
+        if not price or price <= 0:
+            price = limit if filled > 0 else ref_price  # 체결가를 모르면 지정가(최악 가격)로 보수적 기록
         return filled, price
 
     def _buy(self, sym, price):
@@ -234,8 +276,7 @@ class Bot:
             self.tg.send(f"↪️ {sym} 지정가 미체결로 매수 취소 (급등 구간)")
             return
         self.state["positions"][sym] = {"qty": filled, "entry": entry, "ex": self.ex(sym)}
-        self.state["trades"].append({"sym": sym, "side": "buy", "qty": filled, "price": entry})
-        self._save()
+        self._record({"sym": sym, "side": "buy", "qty": filled, "price": round(entry, 4), "reason": "목표가 돌파"})
         part = "" if filled == qty else f" (주문 {qty}주 중 일부)"
         self.tg.send(f"🟢 매수 {sym} {filled}주 @ {usd(entry)}{part} / 목표가 {usd(self.state['plans'][sym]['target'])}")
 
@@ -244,15 +285,15 @@ class Bot:
         if not pos:
             return
         qty = pos["qty"]
-        if not self.cfg.dry_run:
-            held = self.api.holdings(self.ex(sym)).get(sym, {"qty": 0})["qty"]
-            qty = min(qty, held)  # 봇이 산 만큼만, 실제 보유 이내로
-            if qty <= 0:
-                self.state["positions"].pop(sym)
-                self._save()
-                self.tg.send(f"⚠️ {sym} 보유 수량이 없어 매도 생략 (앱에서 직접 판 경우)")
-                return
         try:
+            if not self.cfg.dry_run:
+                held = self.api.holdings(self.ex(sym)).get(sym, {"qty": 0})["qty"]
+                qty = min(qty, held)  # 봇이 산 만큼만, 실제 보유 이내로
+                if qty <= 0:
+                    self.state["positions"].pop(sym)
+                    self._save()
+                    self.tg.send(f"⚠️ {sym} 보유 수량이 없어 매도 생략 (앱에서 직접 판 경우)")
+                    return
             sold, fill = self._execute("sell", sym, qty, price)
         except KISError as e:
             self.tg.send(f"❌ {sym} 매도 실패: {e} — 다음 확인 때 재시도")
@@ -265,18 +306,22 @@ class Bot:
         pos["qty"] -= sold
         if pos["qty"] <= 0:
             self.state["positions"].pop(sym)
-        self.state["trades"].append({"sym": sym, "side": "sell", "qty": sold, "price": fill, "pnl": pnl})
-        self._save()
+        self._record({"sym": sym, "side": "sell", "qty": sold, "price": round(fill, 4),
+                      "pnl": round(pnl, 2), "reason": reason})
         rest = f" (잔량 {pos['qty']}주 재시도)" if pos["qty"] > 0 else ""
-        self.tg.send(f"🔴 매도 {sym} {sold}주 @ ~{usd(fill)} ({reason}) 손익 {pnl:+,.2f}달러{rest}")
+        self.tg.send(f"🔴 매도 {sym} {sold}주 @ {usd(fill)} ({reason}) 손익 {pnl:+,.2f}달러{rest}")
 
     def _pnl(self, entry, price, qty):
         return (price - entry) * qty - (entry + price) * qty * self.cfg.fee_pct / 100
 
     def sell_all(self, prices, reason):
         for sym in list(self.state["positions"]):
-            price = prices.get(sym) or self.api.price(sym, self.ex(sym))
-            self._sell(sym, price, reason)
+            try:  # 한 종목 오류로 나머지 청산이 막히지 않게
+                price = prices.get(sym) or self.api.price(sym, self.ex(sym))
+                self._sell(sym, price, reason)
+            except Exception as e:
+                log.exception("%s 청산 오류", sym)
+                self.tg.send(f"❌ {sym} 청산 실패: {e} — 다음 확인 때 재시도")
 
     # ─── 텔레그램 명령 ────────────────────────────────
     def handle_commands(self):
@@ -293,9 +338,10 @@ class Bot:
                 self.tg.send("⏸ 신규 매수 중단 (보유분 손절·청산은 계속). /resume 로 재개")
             elif cmd == "/resume":
                 self.state["paused"] = False
-                self.state["liquidate"] = False
+                if not self.state["halted"]:  # 손실한도 청산은 /resume 으로도 풀리지 않음
+                    self.state["liquidate"] = False
                 self._save()
-                self.tg.send("▶️ 재개")
+                self.tg.send("▶️ 재개" + (" (오늘은 손실한도 도달로 신규 매수 없음)" if self.state["halted"] else ""))
             elif cmd == "/status":
                 self.tg.send(self.status_text())
             elif cmd in ("/help", "/start"):

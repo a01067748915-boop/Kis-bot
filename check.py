@@ -36,6 +36,11 @@ for ex in sorted(set(cfg.targets.values())):
             print(f"   {v['name']}({sym}) {v['qty']}주 @ {usd(v['avg'])}")
     except Exception as e:
         print(f"❌ 잔고 조회({ex}) 실패: {e}")
+    try:
+        f = api.fills(ex, datetime.now(ET).strftime("%Y%m%d"))
+        print(f"✅ 체결내역 조회({ex}) 성공: 오늘 {len(f)}건")
+    except Exception as e:
+        print(f"⚠️ 체결내역 조회({ex}) 실패: {e} — 봇은 잔고 변화로 체결을 확인합니다")
 
 tg = Telegram(cfg.tg_token, cfg.tg_chat)
 if tg.enabled:
