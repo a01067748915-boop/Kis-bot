@@ -1,0 +1,50 @@
+#!/bin/bash
+# 서버 설치 스크립트: bash setup.sh
+set -e
+cd "$(dirname "$0")"
+DIR="$(pwd)"
+USER_NAME="$(whoami)"
+
+echo "▶ 시간대를 한국시간으로 설정"
+sudo timedatectl set-timezone Asia/Seoul
+
+echo "▶ 파이썬 설치"
+sudo apt-get update -qq
+sudo apt-get install -y -qq python3-venv python3-pip
+
+echo "▶ 가상환경 & 패키지"
+python3 -m venv venv
+./venv/bin/pip install -q -r requirements.txt
+
+if [ ! -f .env ]; then
+  cp .env.example .env
+  chmod 600 .env
+  echo "▶ .env 파일을 만들었습니다. 'nano .env'로 키를 입력하세요."
+fi
+
+echo "▶ 자동 실행 서비스 등록"
+sudo tee /etc/systemd/system/kisbot.service > /dev/null <<EOF
+[Unit]
+Description=KIS US daytrade bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=${USER_NAME}
+WorkingDirectory=${DIR}
+ExecStart=${DIR}/venv/bin/python ${DIR}/bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+
+echo ""
+echo "✅ 설치 완료. 다음 순서:"
+echo "  1) nano .env            # 키·텔레그램 입력 후 Ctrl+O, Enter, Ctrl+X"
+echo "  2) venv/bin/python check.py        # 연결 점검"
+echo "  3) venv/bin/python backtest.py --sweep   # 백테스트"
+echo "  4) sudo systemctl enable --now kisbot    # 봇 시작(서버 재부팅 시 자동 시작)"
+echo "  로그 보기: tail -f bot.log   /  정지: sudo systemctl stop kisbot"
