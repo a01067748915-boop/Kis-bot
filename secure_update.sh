@@ -16,7 +16,7 @@ ask() {  # ask "질문" 기본값(y/n)
   local ans
   read -r -p "$1 [$( [ "$2" = y ] && echo Y/n || echo y/N )] " ans || true
   ans="${ans:-$2}"
-  [[ "$ans" =~ ^[Yy] ]]
+  [[ "$ans" =~ ^[Yyㅛ] ]]  # 한글 자판 상태의 y(ㅛ)도 예로 인식
 }
 
 echo "▶ 봇 폴더: ${DIR}"
@@ -90,6 +90,8 @@ if [ "$WAS_RUNNING" = yes ] || ask "봇을 시작할까요?" y; then
     exit 1
   fi
   echo "✅ 봇 정상 실행 중"
+else
+  echo "⏸  봇을 시작하지 않았습니다 — 켜려면: sudo systemctl enable --now kisbot"
 fi
 
 # ─── 6. 서버 보안 (선택) ─────────────────────────────
