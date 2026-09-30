@@ -303,3 +303,53 @@ def test_env_example_parses_to_valid_config():
     cfg = Config({k: v for k, v in env.items() if v})
     assert cfg.env == "mock" and cfg.dry_run and cfg.targets == {"QQQM": "NAS", "SOXX": "NAS"}
     assert cfg.entry_start == (9, 35) and cfg.k == 0.5
+
+
+# ─── 보안 ───
+def test_redact_secrets_in_message_and_traceback():
+    import logging
+    f = botmod.RedactSecrets(["SECRETKEY123", "12345678", ""])
+    rec = logging.LogRecord("t", logging.ERROR, "", 0, "키 %s 계좌 %s", ("SECRETKEY123", "12345678-01"), None)
+    f.filter(rec)
+    assert rec.getMessage() == "키 *** 계좌 ***-01"
+    try:
+        raise ValueError("bad SECRETKEY123")
+    except ValueError:
+        import sys
+        rec = logging.LogRecord("t", logging.ERROR, "", 0, "오류", None, sys.exc_info())
+    f.filter(rec)
+    assert "SECRETKEY123" not in rec.exc_text
+
+
+def test_secure_files_closes_env_permissions(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("KIS_APP_KEY=x")
+    env.chmod(0o644)
+    old = __import__("os").umask(0o022)
+    try:
+        assert botmod.secure_files(env)
+        assert env.stat().st_mode & 0o777 == 0o600
+        assert botmod.secure_files(env) == []
+    finally:
+        __import__("os").umask(old)
+
+
+def test_telegram_allowed_users(monkeypatch):
+    tg = Telegram("T", "-100", ["11"])
+    now = tg.started + 1
+    updates = {"result": [
+        {"update_id": 1, "message": {"date": now, "text": "/stop", "chat": {"id": -100}, "from": {"id": 99}}},
+        {"update_id": 2, "message": {"date": now, "text": "/status", "chat": {"id": -100}, "from": {"id": 11}}},
+    ]}
+    monkeypatch.setattr(botmod.requests, "get", lambda *a, **k: type("R", (), {"json": lambda self: updates})())
+    assert tg.commands() == ["/status"]
+    assert botmod.security_warnings(Config({"TELEGRAM_CHAT_ID": "-100"}))
+    assert not botmod.security_warnings(Config({"TELEGRAM_CHAT_ID": "-100", "TELEGRAM_ALLOWED_USERS": "11"}))
+    assert not botmod.security_warnings(Config({"TELEGRAM_CHAT_ID": "12345"}))
+
+
+def test_buy_over_allocation_refused(make):
+    b, api, tg = make()
+    with pytest.raises(KISError):
+        b._execute("buy", "QQQM", 20, 100.0)  # 2000달러 > 배정 1000달러
+    assert api.orders == []

@@ -73,6 +73,8 @@ class Config:
         self.fill_wait_sec = int(g("FILL_WAIT_SEC", "12"))
         self.tg_token = g("TELEGRAM_TOKEN", "")
         self.tg_chat = g("TELEGRAM_CHAT_ID", "")
+        # 명령을 보낼 수 있는 텔레그램 사용자 ID (쉼표 구분, 비우면 채팅방 ID만 확인)
+        self.tg_users = {u.strip() for u in g("TELEGRAM_ALLOWED_USERS", "").split(",") if u.strip()}
 
     @property
     def alloc(self):
@@ -85,8 +87,9 @@ class Config:
 
 # ─── 텔레그램 ─────────────────────────────────────────
 class Telegram:
-    def __init__(self, token, chat_id):
+    def __init__(self, token, chat_id, allowed_users=()):
         self.token, self.chat = token, str(chat_id)
+        self.users = {str(u) for u in allowed_users}
         self.offset = None
         self.enabled = bool(token and chat_id)
         self.started = time.time()  # 봇 시작 전에 쌓인 명령은 무시
@@ -124,6 +127,9 @@ class Telegram:
             msg = u.get("message") or {}
             text = (msg.get("text") or "").strip()
             if msg.get("date", 0) < self.started:  # 재시작 전 명령(/stop 등)이 뒤늦게 실행되지 않게
+                continue
+            sender = str((msg.get("from") or {}).get("id", ""))
+            if self.users and sender not in self.users:  # 허용한 사람만 (단체방 대비)
                 continue
             if text and str(msg.get("chat", {}).get("id")) == self.chat:  # 본인 채팅만
                 cmds.append(text.split()[0].split("@")[0].lower())  # /stop@봇이름 도 인식
@@ -220,6 +226,8 @@ class Bot:
         """실제 체결 수량과 평균 체결가 반환"""
         slip = self.cfg.limit_slip_pct / 100
         limit = round(ref_price * (1 + slip) if side == "buy" else ref_price * (1 - slip), 2)
+        if side == "buy" and qty * limit > self.cfg.alloc * 1.02:  # 설정·계산 오류로 과다 매수 방지
+            raise KISError(f"주문금액 {usd(qty * limit)}이 종목당 배정액 {usd(self.cfg.alloc)} 초과")
         if self.cfg.dry_run:
             return qty, ref_price
         ex = self.ex(sym)
@@ -442,20 +450,78 @@ class Bot:
                 self._buy(sym, price)
 
 
+# ─── 보안 ─────────────────────────────────────────────
+SECRET_KEYS = ("KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT", "TELEGRAM_TOKEN")
+
+
+class RedactSecrets(logging.Filter):
+    """로그에 키·계좌번호·토큰이 섞여 나가지 않게 가림"""
+
+    def __init__(self, secrets):
+        super().__init__()
+        self.secrets = sorted((x for x in secrets if x and len(x) >= 6), key=len, reverse=True)
+
+    def redact(self, text):
+        for x in self.secrets:
+            text = text.replace(x, "***")
+        return text
+
+    def filter(self, record):
+        msg = record.getMessage()
+        if record.exc_info and not record.exc_text:
+            record.exc_text = logging.Formatter().formatException(record.exc_info)
+        red = self.redact(msg)
+        if red != msg:
+            record.msg, record.args = red, None
+        if record.exc_text:
+            record.exc_text = self.redact(record.exc_text)
+        return True
+
+
+def secure_files(env_file=HERE / ".env"):
+    """새로 만드는 파일은 본인만 읽게, .env 권한이 열려 있으면 닫고 경고 목록 반환"""
+    os.umask(0o077)
+    warnings = []
+    if env_file.exists() and env_file.stat().st_mode & 0o077:
+        try:
+            os.chmod(env_file, 0o600)
+            warnings.append(".env 권한이 다른 사용자에게 열려 있어 600으로 바꿨습니다")
+        except OSError:
+            warnings.append(".env 권한이 다른 사용자에게 열려 있습니다 — chmod 600 .env 하세요")
+    return warnings
+
+
+def security_warnings(cfg):
+    out = []
+    if cfg.tg_chat.startswith("-") and not cfg.tg_users:
+        out.append("텔레그램 단체방이라 방 안의 누구나 /stop 등을 보낼 수 있습니다 — "
+                   "TELEGRAM_ALLOWED_USERS 에 본인 사용자 ID를 넣으세요")
+    return out
+
+
 # ─── 실행 ─────────────────────────────────────────────
 def setup_logging():
     handler = RotatingFileHandler(HERE / "bot.log", maxBytes=2_000_000, backupCount=5, encoding="utf-8")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
-                        handlers=[handler, logging.StreamHandler(sys.stdout)])
+    secrets = [os.environ.get(k, "") for k in SECRET_KEYS]
+    secrets.append(os.environ.get("KIS_ACCOUNT", "").split("-")[0])  # 계좌번호 앞 8자리만 찍혀도 가림
+    redact = RedactSecrets(secrets)
+    handlers = [handler, logging.StreamHandler(sys.stdout)]
+    for h in handlers:
+        h.addFilter(redact)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
 
 
 def main():
+    warnings = secure_files()  # 로그·상태 파일을 만들기 전에
     load_dotenv(HERE / ".env")
     setup_logging()
     cfg = Config()
     api = KIS(cfg.env, os.environ["KIS_APP_KEY"], os.environ["KIS_APP_SECRET"], os.environ["KIS_ACCOUNT"], HERE)
-    tg = Telegram(cfg.tg_token, cfg.tg_chat)
+    tg = Telegram(cfg.tg_token, cfg.tg_chat, cfg.tg_users)
     bot = Bot(cfg, api, tg)
+    for w in warnings + security_warnings(cfg):
+        log.warning(w)
+        tg.send(f"🔐 {w}")
     tg.send(f"🤖 미국 단타 봇 시작 ({'모의' if cfg.env == 'mock' else '실전'}"
             f"{', 주문없음(DRY_RUN)' if cfg.dry_run else ''})\n"
             f"종목 {', '.join(cfg.targets)} / 예산 {usd(cfg.budget)}")
