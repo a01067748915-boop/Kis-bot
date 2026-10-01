@@ -5,6 +5,7 @@
   python strategies.py --targets QQQM:NAS,SOXX:NAS,SCHD:AMS --safe SGOV:AMS
   python strategies.py --only trend --years 8
   python strategies.py --only pullback --targets SOXX:NAS,QQQM:NAS,AMD:NAS,PLTR:NAS
+  python strategies.py --only portfolio --targets SOXX:NAS,SMH:NAS,AMD:NAS,PLTR:NAS,HOOD:NAS
 
 A. 눌림목 매수 (종목별, 며칠 보유)
    200일선 위(상승 추세)인데 RSI(2)가 기준 아래로 급락하면 다음 날 시가에 매수
@@ -68,6 +69,10 @@ def summary(curve, days=None):
 def fmt(r, orders=None):
     s = f"수익 {r['수익']:+7.1f}% (연 {r['연']:+5.1f}%), 최대낙폭 {r['낙폭']:6.1f}%"
     return s + (f", 주문 {orders}회" if orders is not None else "")
+
+
+def usd(x):
+    return f"${x:,.0f}"
 
 
 def by_date(bars):
@@ -212,6 +217,108 @@ def run_pullback(datasets, opts):
             print(f"  {mark} {name:<12}: 매매 {n}회, 승률 {win:.0f}%, 1회평균 {avg:+.2f}% (수수료·슬리피지 차감 후)")
 
 
+# ─── A'. 눌림목 매수 — 예산을 모아 쓰는 포트폴리오 ─────
+def indicators(bars, trend_ma=200, exit_ma=5):
+    """날짜별 {close, rsi, trend(종가>추세선), recovered(종가>단기선)} — 그날 종가까지로 계산"""
+    closes = [b["close"] for b in bars]
+    r = rsi(closes, 2)
+    out = {}
+    for i, b in enumerate(bars):
+        if i + 1 < max(trend_ma, exit_ma) or r[i] is None:
+            continue
+        trend = not trend_ma or closes[i] > sum(closes[i + 1 - trend_ma:i + 1]) / trend_ma
+        out[b["date"]] = {"rsi": r[i], "trend": trend,
+                          "recovered": closes[i] > sum(closes[i + 1 - exit_ma:i + 1]) / exit_ma}
+    return out
+
+
+def portfolio(datasets, budget=950.0, slots=2, rsi_max=10, trend_ma=200, max_days=10,
+              fee_pct=0.25, slip_pct=0.05, whole_shares=True):
+    """예산 하나를 slots 칸으로 나눠, 신호 난 종목 중 RSI가 가장 낮은 것부터 채움
+    → {"dates", "curve"(달러), "trades"[(수익률, 보유일)], "used"(평균 사용 칸 비율)}"""
+    fee, slip = fee_pct / 100, slip_pct / 100
+    ind = {s: indicators(b, trend_ma) for s, b in datasets.items()}
+    px = {s: by_date(b) for s, b in datasets.items()}
+    common = sorted(set.intersection(*(set(v) for v in px.values())))
+    prev_of = dict(zip(common[1:], common))
+    dates = [d for d in common[1:] if all(prev_of[d] in ind[s] for s in ind)]  # 지표가 다 준비된 날부터
+    cash, pos, curve, trades, used = budget, {}, [], [], 0
+    for d in dates:
+        y = prev_of[d]
+        # 1) 매도: 전날 종가가 단기선 위로 회복했거나 최대 보유일 도달 → 오늘 시가
+        for s in list(pos):
+            p = pos[s]
+            p["days"] += 1
+            if ind[s][y]["recovered"] or p["days"] >= max_days:
+                got = p["qty"] * px[s][d]["open"] * (1 - slip) * (1 - fee)
+                cash += got
+                trades.append((got / p["cost"] - 1, p["days"]))
+                del pos[s]
+        # 2) 매수: 빈 칸만큼, 전날 RSI 낮은 순
+        equity_open = cash + sum(p["qty"] * px[s][d]["open"] for s, p in pos.items())
+        cands = sorted((ind[s][y]["rsi"], s) for s in ind
+                       if s not in pos and ind[s][y]["trend"] and ind[s][y]["rsi"] < rsi_max)
+        for _, s in cands:
+            if len(pos) >= slots:
+                break
+            price = px[s][d]["open"] * (1 + slip)
+            alloc = min(equity_open / slots, cash)
+            qty = int(alloc * (1 - fee) / price) if whole_shares else alloc * (1 - fee) / price
+            if qty <= 0:
+                continue  # 1주도 못 사면 다음 후보
+            cost = qty * price / (1 - fee)
+            cash -= cost
+            pos[s] = {"qty": qty, "cost": cost, "days": 0}
+        used += len(pos)
+        curve.append(cash + sum(p["qty"] * px[s][d]["close"] for s, p in pos.items()))
+    return {"dates": dates, "curve": curve, "trades": trades, "used": used / max(1, len(dates)) / slots}
+
+
+PORTFOLIO_VARIANTS = [  # (이름, slots, rsi_max)
+    ("RSI<10 1칸", 1, 10), ("RSI<10 2칸", 2, 10), ("RSI<10 3칸", 3, 10),
+    ("RSI<5  2칸", 2, 5), ("RSI<20 3칸", 3, 20),
+]
+
+
+def yearly(dates, curve, start_value):
+    out, last, prev_end = [], None, start_value
+    for d, v in zip(dates, curve):
+        if last and d[:4] != last[0]:
+            out.append((last[0], last[1] / prev_end - 1))
+            prev_end = last[1]
+        last = (d[:4], v)
+    if last:
+        out.append((last[0], last[1] / prev_end - 1))
+    return " ".join(f"{yr} {r * 100:+.0f}%" for yr, r in out)
+
+
+def run_portfolio(datasets, opts, budget):
+    print(f"\n━━ A'. 눌림목 매수 — 예산 {usd(budget)} 하나로 모든 종목 감시, 신호 난 종목에 칸 단위로 투입 ━━")
+    print(f"  종목 {', '.join(datasets)} / 같은 날 여러 신호면 RSI 낮은 순 / 1주 단위 매수")
+    if len(datasets) < 2:
+        print("  종목이 2개 이상 필요합니다")
+        return
+    base = portfolio(datasets, budget, **opts)
+    dates = base["dates"]
+    if len(dates) < 60:
+        print(f"  공통 데이터 부족 ({len(dates)}일) — --years 를 늘리세요")
+        return
+    hold = [simulate(dates, {s: by_date(b)}, [s] * len(dates), **opts)[0] for s, b in datasets.items()]
+    eq_hold = [sum(c[i] for c in hold) / len(hold) * budget for i in range(len(dates))]
+    print(f"  기간 {dates[0]}~{dates[-1]} ({len(dates)}일)")
+    print(f"  균등 보유     : {fmt(summary([v / budget for v in eq_hold]))}")
+    print(f"     연도별   : {yearly(dates, eq_hold, budget)}")
+    for name, slots, rmax in PORTFOLIO_VARIANTS:
+        r = portfolio(datasets, budget, slots=slots, rsi_max=rmax, **opts)
+        t = r["trades"]
+        n = len(t)
+        avg = sum(x for x, _ in t) / n * 100 if n else 0
+        win = sum(x > 0 for x, _ in t) / n * 100 if n else 0
+        print(f"  {name:<11}: {fmt(summary([v / budget for v in r['curve']]))}, 매매 {n}회,"
+              f" 승률 {win:.0f}%, 1회평균 {avg:+.2f}%, 투자비율 {r['used'] * 100:.0f}%")
+        print(f"     연도별   : {yearly(r['dates'], r['curve'], budget)}  → 최종 {usd(r['curve'][-1])}")
+
+
 # ─── ③ 모멘텀 순환 ───────────────────────────────────
 def rotation_holds(dates, data, cands, safe, lookback):
     """매월 첫 거래일에만 교체. 최근 lookback 거래일 수익률 1등, 1등도 0 이하면 대피처(없으면 현금)"""
@@ -265,7 +372,7 @@ def main():
     p.add_argument("--years", type=int, default=5)
     p.add_argument("--targets", help="종목, 예: QQQM:NAS,SOXX:NAS,SCHD:AMS (기본: .env 의 TARGETS)")
     p.add_argument("--safe", help="③ 대피처 종목, 예: SGOV:AMS (없으면 현금)")
-    p.add_argument("--only", choices=["pullback", "trend", "rotation"], help="한 전략만 실행")
+    p.add_argument("--only", choices=["pullback", "portfolio", "trend", "rotation"], help="한 전략만 실행")
     p.add_argument("--fee", type=float, default=None, help="편도 수수료(%%) 덮어쓰기")
     p.add_argument("--csv", nargs="+", help="date,open,high,low,close CSV 파일들로 테스트 (파일명=종목명)")
     a = p.parse_args()
@@ -296,6 +403,8 @@ def main():
     stocks = {s: b for s, b in datasets.items() if s != safe}
     if a.only in (None, "pullback"):
         run_pullback(stocks, opts)
+    if a.only in (None, "portfolio"):
+        run_portfolio(stocks, opts, float(g("BUDGET_USD", "950")))
     if a.only in (None, "trend"):
         run_trend(stocks, opts)
     if a.only in (None, "rotation"):

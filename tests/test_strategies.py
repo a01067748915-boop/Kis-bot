@@ -74,3 +74,30 @@ def test_pullback_stop_loss():
     bars.append(bar("y", 90, 90))
     _, trades, _ = pullback(bars, rsi_max=10, trend_ma=20, stop_pct=8, fee_pct=0, slip_pct=0)
     assert trades[0][0] == pytest.approx(-0.08)
+
+
+def _dip_series(dip_day, drop, n=40):
+    """꾸준히 오르다 dip_day 에 drop 만큼 급락, 다음 날부터 회복"""
+    closes = [50 + i * 3 for i in range(n)]
+    closes[dip_day] = closes[dip_day - 1] - drop
+    closes[dip_day + 1] = closes[dip_day] + 2
+    return [bar(f"d{i:02d}", c, c) for i, c in enumerate(closes)]
+
+
+def test_portfolio_fills_slots_by_lowest_rsi_and_whole_shares():
+    from strategies import portfolio
+    data = {"A": _dip_series(30, 16), "B": _dip_series(30, 22), "C": _dip_series(34, 16)}
+    kw = dict(rsi_max=20, trend_ma=20, fee_pct=0, slip_pct=0)
+    one = portfolio(data, budget=1000, slots=1, **kw)
+    # 같은 날 A·B 신호 → 더 깊이 빠진(RSI 낮은) B 를 117에 사서 149에 팖(A는 칸이 없어 건너뜀), 이후 C 135→161
+    assert [round(t, 4) for t, _ in one["trades"]] == [round(149 / 117 - 1, 4), round(161 / 135 - 1, 4)]
+    two = portfolio(data, budget=1000, slots=2, **kw)
+    assert len(two["trades"]) == 3  # 칸이 2개면 A도 삼
+    poor = portfolio(data, budget=50, slots=2, **kw)  # 칸 예산 25달러로는 1주도 못 삼
+    assert poor["trades"] == [] and poor["curve"][-1] == 50
+
+
+def test_yearly_returns():
+    from strategies import yearly
+    assert yearly(["20230101", "20231231", "20240101", "20241231"], [110, 121, 121, 133.1], 100) \
+        == "2023 +21% 2024 +10%"
