@@ -133,7 +133,7 @@ def main():
     p.add_argument("--k", type=float, default=None)
     p.add_argument("--sweep", action="store_true", help="K 0.3~1.0 비교")
     p.add_argument("--compare", action="store_true", help="청산 방식·추세필터 조합 비교")
-    p.add_argument("--exit", choices=["close", "next_open"], default="close",
+    p.add_argument("--exit", choices=["close", "next_open"], default=None,
                    help="close=당일 종가 청산(현재 봇), next_open=다음 날 시가 청산")
     p.add_argument("--ma", type=int, default=None, help="추세필터 이동평균 일수 덮어쓰기 (0=끔)")
     p.add_argument("--stop", type=float, default=None, help="손절(%%) 덮어쓰기")
@@ -144,6 +144,7 @@ def main():
 
     load_dotenv(HERE / ".env")
     g = os.environ.get
+    a.exit = a.exit or g("EXIT_MODE", "close")  # 기본은 봇 설정과 같은 청산 방식
     k = a.k if a.k is not None else float(g("K", "0.5"))
     opts = dict(ma=int(g("MA_FILTER", "5")), stop_pct=float(g("STOP_LOSS_PCT", "2")),
                 chase_pct=float(g("MAX_CHASE_PCT", "1")), fee_pct=float(g("FEE_PCT", "0.25")))

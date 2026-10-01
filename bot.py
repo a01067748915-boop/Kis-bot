@@ -3,7 +3,9 @@
 
 전략
   목표가 = 오늘 시가 + K × (전일 고가 − 전일 저가)
-  현재가가 목표가를 돌파하면 매수 → 손절 또는 장 마감 전 전량 매도
+  현재가가 목표가를 돌파하면 매수 → 손절, 또는 청산 방식(EXIT_MODE)에 따라 매도
+    close     : 장 마감 전 전량 매도 (당일 청산)
+    next_open : 그날은 손절만 지키고 들고 넘어가 다음 거래일 장 초반(ENTRY_START)에 매도
   (미국은 시장가 주문이 없어 현재가보다 약간 유리한 지정가로 주문, 미체결분은 취소)
 
 시간은 모두 뉴욕 현지시간 기준이라 서머타임이 바뀌어도 자동으로 맞춰집니다.
@@ -68,6 +70,9 @@ class Config:
         self.entry_start = hm(g("ENTRY_START", "09:35"))         # 뉴욕 시간
         self.entry_end = hm(g("ENTRY_END", "15:00"))
         self.exit_time = hm(g("EXIT_TIME", "15:45"))
+        self.exit_mode = g("EXIT_MODE", "close").strip().lower()
+        if self.exit_mode not in ("close", "next_open"):
+            raise ValueError("EXIT_MODE 는 close 또는 next_open")
         self.market_close = (16, 0)
         self.poll_sec = int(g("POLL_SEC", "10"))
         self.fill_wait_sec = int(g("FILL_WAIT_SEC", "12"))
@@ -217,6 +222,7 @@ class Bot:
         for s, p in plans.items():
             lines.append(f"{s}: 시가 {usd(p['open'])} → 목표 {usd(p['target'])}"
                          + ("" if p["active"] else " (추세필터로 제외)"))
+        lines.append("청산: " + ("다음 거래일 장 초반" if self.cfg.exit_mode == "next_open" else "장 마감 전"))
         lines.append(f"종목당 {usd(self.cfg.alloc)}, 손절 -{self.cfg.stop_loss_pct}%, "
                      f"일일한도 -{usd(self.cfg.daily_loss_limit)}")
         self.tg.send("\n".join(lines))
@@ -374,7 +380,10 @@ class Bot:
             paused = self.state.get("paused", False)
             leftover = self.state.get("positions", {})
             if leftover:
-                self.tg.send(f"⚠️ 전날 청산 못 한 봇 보유분 {list(leftover)} → 오늘 장 초반에 매도합니다.")
+                if self.cfg.exit_mode == "next_open":
+                    self.tg.send(f"🌅 전날 산 {list(leftover)} → 오늘 장 초반에 매도합니다.")
+                else:
+                    self.tg.send(f"⚠️ 전날 청산 못 한 봇 보유분 {list(leftover)} → 오늘 장 초반에 매도합니다.")
             self.state = self._fresh(today)
             self.state["paused"] = paused
             for p in leftover.values():
@@ -388,7 +397,9 @@ class Bot:
         if now.weekday() >= 5 or s["skip_day"] or s["closed"] or t < self.cfg.entry_start:
             return
         if t >= self.cfg.market_close:
-            if s["positions"]:
+            if s["positions"] and self.cfg.exit_mode == "next_open":
+                self.tg.send(f"🌙 {list(s['positions'])} 들고 넘어감 → 다음 거래일 장 초반에 매도")
+            elif s["positions"]:
                 self.tg.send(f"⚠️ 장 마감까지 매도 못 한 보유분 {list(s['positions'])} → 다음 거래일 초반에 매도")
             s["closed"] = True
             self._save()
@@ -405,8 +416,9 @@ class Bot:
             return
         prices = {sym: self.api.price(sym, self.ex(sym)) for sym in syms}
 
-        # 1) 장 마감 전 청산 (미체결이면 16:00까지 매 주기 재시도)
-        if t >= self.cfg.exit_time:
+        # 1) 당일 청산 모드: 장 마감 전 청산 (미체결이면 16:00까지 매 주기 재시도)
+        #    다음날 시가 모드는 여기서 팔지 않고 손절만 지키다 16:00에 마감
+        if t >= self.cfg.exit_time and self.cfg.exit_mode == "close":
             if s["positions"]:
                 self.sell_all(prices, "장마감 청산")
             if not self.state["positions"]:
@@ -420,7 +432,7 @@ class Bot:
             self.sell_all(prices, "청산 재시도")
         for sym, pos in list(s["positions"].items()):
             if pos.get("carry"):
-                self._sell(sym, prices[sym], "전날 이월분 정리")
+                self._sell(sym, prices[sym], "다음날 시가 청산" if self.cfg.exit_mode == "next_open" else "전날 이월분 정리")
             elif prices[sym] <= pos["entry"] * (1 - self.cfg.stop_loss_pct / 100):
                 self._sell(sym, prices[sym], f"손절 -{self.cfg.stop_loss_pct}%")
 
@@ -524,6 +536,7 @@ def main():
         tg.send(f"🔐 {w}")
     tg.send(f"🤖 미국 단타 봇 시작 ({'모의' if cfg.env == 'mock' else '실전'}"
             f"{', 주문없음(DRY_RUN)' if cfg.dry_run else ''})\n"
+            f"청산 방식: {'다음날 시가' if cfg.exit_mode == 'next_open' else '당일 장 마감 전'}\n"
             f"종목 {', '.join(cfg.targets)} / 예산 {usd(cfg.budget)}")
 
     errors = 0

@@ -353,3 +353,50 @@ def test_buy_over_allocation_refused(make):
     with pytest.raises(KISError):
         b._execute("buy", "QQQM", 20, 100.0)  # 2000달러 > 배정 1000달러
     assert api.orders == []
+
+
+# ─── 다음날 시가 청산 ───
+def test_next_open_holds_overnight_and_sells_next_morning(make):
+    b, api, tg = make(EXIT_MODE="next_open")
+    b.step(at(9, 40))
+    api.prices["QQQM"] = 102.2
+    b.step(at(10, 0))
+    assert b.state["positions"]["QQQM"]["qty"] == 9
+    b.step(at(15, 50))  # 당일 청산 시각이 지나도 안 팖
+    assert "QQQM" in b.state["positions"]
+    b.step(at(16, 0))
+    assert b.state["closed"] and any("들고 넘어감" in m for m in tg.sent)
+
+    api.daily_bars = lambda *a, **k: bars() + [{"date": "20260106", "open": 105, "high": 105, "low": 104, "close": 104}]
+    api.prices["QQQM"] = 104
+    tue = datetime(2026, 1, 6, 9, 30, tzinfo=ET)
+    b.step(tue)  # 장 초반(ENTRY_START 09:35) 전에는 대기
+    assert "QQQM" in b.state["positions"]
+    b.step(tue.replace(minute=36))
+    assert "QQQM" not in b.state["positions"]
+    sell = journal(b)[-1]
+    assert sell["reason"] == "다음날 시가 청산" and float(sell["pnl"]) > 0
+
+
+def test_next_open_still_stops_out_same_day(make):
+    b, api, tg = make(EXIT_MODE="next_open")
+    b.step(at(9, 40))
+    api.prices["QQQM"] = 102.2
+    b.step(at(10, 0))
+    api.prices["QQQM"] = 99.5
+    b.step(at(15, 50))
+    assert not b.state["positions"]
+
+
+def test_next_open_holiday_keeps_position(make):
+    b, api, tg = make(EXIT_MODE="next_open")
+    b.state = b._fresh("20260102")
+    b.state["positions"] = {"QQQM": {"qty": 3, "entry": 100.0, "ex": "NAS"}}
+    api.daily_bars = lambda *a, **k: bars()[:-1]  # 오늘 시세 없음 = 휴장
+    b.step(at(9, 40))
+    assert "QQQM" in b.state["positions"] and b.state["skip_day"]
+
+
+def test_bad_exit_mode_rejected():
+    with pytest.raises(ValueError):
+        Config({"EXIT_MODE": "tomorrow"})

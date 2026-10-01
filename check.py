@@ -22,7 +22,8 @@ if (HERE / ".git").exists():
         warnings.append(f"{tracked} 이(가) git에 올라가 있습니다 — 키를 재발급하고 git rm --cached 하세요")
 for w in warnings + security_warnings(cfg):
     print(f"🔐 {w}")
-print(f"환경: {cfg.env} / DRY_RUN: {cfg.dry_run} / 예산 {usd(cfg.budget)} / 종목당 {usd(cfg.alloc)}")
+print(f"환경: {cfg.env} / DRY_RUN: {cfg.dry_run} / 예산 {usd(cfg.budget)} / 종목당 {usd(cfg.alloc)}"
+      f" / 청산: {cfg.exit_mode}")
 print(f"뉴욕 현재시각: {datetime.now(ET):%Y-%m-%d %H:%M}")
 
 api = KIS(cfg.env, os.environ["KIS_APP_KEY"], os.environ["KIS_APP_SECRET"], os.environ["KIS_ACCOUNT"], HERE)
