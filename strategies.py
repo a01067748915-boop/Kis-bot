@@ -4,6 +4,11 @@
   python strategies.py                                  # .env 의 TARGETS, 최근 5년, 대피처 없음(현금)
   python strategies.py --targets QQQM:NAS,SOXX:NAS,SCHD:AMS --safe SGOV:AMS
   python strategies.py --only trend --years 8
+  python strategies.py --only pullback --targets SOXX:NAS,QQQM:NAS,AMD:NAS,PLTR:NAS
+
+A. 눌림목 매수 (종목별, 며칠 보유)
+   200일선 위(상승 추세)인데 RSI(2)가 기준 아래로 급락하면 다음 날 시가에 매수
+   → 종가가 5일선 위로 회복하면 다음 날 시가에 매도 (최대 보유 10일, 선택: 손절)
 
 ② 추세 추종 (종목별)
    전날 종가가 N일 이동평균 위면 보유, 아래면 팔고 현금. ±밴드를 주면 이평선 근처의 잦은 매매를 줄임
@@ -107,6 +112,106 @@ def run_trend(datasets, opts):
             print(f"  {label:<14}: {fmt(summary(curve), orders)}, 보유기간 {inv:.0f}%")
 
 
+# ─── A. 눌림목 매수 ───────────────────────────────────
+def rsi(closes, n=2):
+    """와일더 방식 RSI. 앞쪽 n개는 None"""
+    out = [None] * len(closes)
+    if len(closes) <= n:
+        return out
+    gains = [max(closes[i] - closes[i - 1], 0) for i in range(1, len(closes))]
+    losses = [max(closes[i - 1] - closes[i], 0) for i in range(1, len(closes))]
+    ag, al = sum(gains[:n]) / n, sum(losses[:n]) / n
+    for i in range(n, len(closes)):
+        if i > n:
+            ag = (ag * (n - 1) + gains[i - 1]) / n
+            al = (al * (n - 1) + losses[i - 1]) / n
+        out[i] = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+    return out
+
+
+def pullback(bars, rsi_max=10, trend_ma=200, exit_ma=5, max_days=10, stop_pct=None, fee_pct=0.25, slip_pct=0.05):
+    """눌림목 매수 1종목 시뮬레이션 → (자산곡선, 거래목록[(수익률, 보유일, 진입 인덱스)], 시작 인덱스)
+    수익률은 매수·매도 수수료와 슬리피지를 모두 뺀 값
+    신호는 전날 종가 기준, 매매는 시가. 손절은 장중 저가가 손절선 아래면 손절가에 체결(불리하게)"""
+    fee, slip = fee_pct / 100, slip_pct / 100
+    closes = [b["close"] for b in bars]
+    r = rsi(closes, 2)
+    start = max(trend_ma, exit_ma, 3)
+    eq, curve, trades = 1.0, [], []
+    pos = None  # entry: 체결가, i: 진입일, base: 매수 수수료를 뗀 투입 자산
+
+    def close_out(px, days):
+        nonlocal eq, pos
+        start_eq = pos["base"] / (1 - fee)
+        eq = pos["base"] * px / pos["entry"] * (1 - fee)
+        trades.append((eq / start_eq - 1, days, pos["i"]))
+        pos = None
+
+    for i in range(start, len(bars)):
+        b, prev = bars[i], bars[i - 1]
+        if pos is None:
+            trend_ok = not trend_ma or prev["close"] > sum(closes[i - trend_ma:i]) / trend_ma
+            if trend_ok and r[i - 1] is not None and r[i - 1] < rsi_max:
+                entry = b["open"] * (1 + slip)
+                pos = {"entry": entry, "i": i, "base": eq * (1 - fee)}
+        else:
+            held = i - pos["i"]
+            recovered = prev["close"] > sum(closes[i - exit_ma:i]) / exit_ma
+            if recovered or held >= max_days:  # 전날 신호 → 오늘 시가에 매도
+                close_out(b["open"] * (1 - slip), held)
+        if pos is not None:
+            stop = pos["entry"] * (1 - stop_pct / 100) if stop_pct else None
+            if stop and b["low"] <= stop:
+                close_out(min(stop, b["open"]) * (1 - slip), i - pos["i"] + 1)  # 갭하락이면 시가에 체결
+            else:
+                eq = pos["base"] * b["close"] / pos["entry"]
+        curve.append(eq)
+    return curve, trades, start
+
+
+PULLBACK_VARIANTS = [  # (이름, rsi_max, trend_ma, stop_pct)
+    ("RSI<5", 5, 200, None), ("RSI<10", 10, 200, None), ("RSI<20", 20, 200, None),
+    ("RSI<10 손절8%", 10, 200, 8), ("RSI<10 추세무시", 10, 0, None),
+]
+
+
+def run_pullback(datasets, opts):
+    print("\n━━ A. 눌림목 매수: 200일선 위 + RSI(2) 급락 → 매수, 5일선 회복 → 매도 (최대 10일) ━━")
+    print("  ※ 1회 평균수익이 비용(약 0.6%)보다 확실히 커야 실전에서 의미 있음")
+    total = {name: [] for name, *_ in PULLBACK_VARIANTS}
+    for sym, bars in datasets.items():
+        if len(bars) < 260:
+            print(f"■ {sym}: 데이터 부족 ({len(bars)}일) — --years 를 늘리세요")
+            continue
+        start = 200
+        dates = [b["date"] for b in bars][start:]
+        hold_curve, _ = simulate(dates, {sym: by_date(bars)}, [sym] * len(dates), **opts)
+        print(f"■ {sym} {dates[0]}~{dates[-1]} ({len(dates)}일)")
+        print(f"  그냥 보유       : {fmt(summary(hold_curve))}")
+        for name, rmax, tma, stop in PULLBACK_VARIANTS:
+            curve, trades, st = pullback(bars, rsi_max=rmax, trend_ma=tma, stop_pct=stop, **opts)
+            curve = curve[start - st:]  # 추세무시 변형도 같은 기간으로 비교
+            trades_in = [(t, d) for t, d, i in trades if i >= start]
+            total[name] += trades_in
+            n = len(trades_in)
+            if not n:
+                print(f"  {name:<12}: 매매 없음")
+                continue
+            avg = sum(t for t, _ in trades_in) / n * 100
+            win = sum(t > 0 for t, _ in trades_in) / n * 100
+            days = sum(d for _, d in trades_in) / n
+            print(f"  {name:<12}: {fmt(summary(curve))}, 매매 {n}회, 승률 {win:.0f}%,"
+                  f" 1회평균 {avg:+.2f}%, 평균보유 {days:.1f}일")
+    print("■ 전체 종목 합산 (1회 평균수익이 핵심)")
+    for name, trades in total.items():
+        n = len(trades)
+        if n:
+            avg = sum(t for t, _ in trades) / n * 100
+            win = sum(t > 0 for t, _ in trades) / n * 100
+            mark = "✅" if avg > 0.5 else ("△" if avg > 0 else "⚠️")
+            print(f"  {mark} {name:<12}: 매매 {n}회, 승률 {win:.0f}%, 1회평균 {avg:+.2f}% (수수료·슬리피지 차감 후)")
+
+
 # ─── ③ 모멘텀 순환 ───────────────────────────────────
 def rotation_holds(dates, data, cands, safe, lookback):
     """매월 첫 거래일에만 교체. 최근 lookback 거래일 수익률 1등, 1등도 0 이하면 대피처(없으면 현금)"""
@@ -160,7 +265,7 @@ def main():
     p.add_argument("--years", type=int, default=5)
     p.add_argument("--targets", help="종목, 예: QQQM:NAS,SOXX:NAS,SCHD:AMS (기본: .env 의 TARGETS)")
     p.add_argument("--safe", help="③ 대피처 종목, 예: SGOV:AMS (없으면 현금)")
-    p.add_argument("--only", choices=["trend", "rotation"], help="한 전략만 실행")
+    p.add_argument("--only", choices=["pullback", "trend", "rotation"], help="한 전략만 실행")
     p.add_argument("--fee", type=float, default=None, help="편도 수수료(%%) 덮어쓰기")
     p.add_argument("--csv", nargs="+", help="date,open,high,low,close CSV 파일들로 테스트 (파일명=종목명)")
     a = p.parse_args()
@@ -188,9 +293,12 @@ def main():
                 datasets.pop(sym)
 
     print(f"\n수수료 편도 {opts['fee_pct']}%, 슬리피지 {opts['slip_pct']}%")
-    if a.only != "rotation":
-        run_trend({s: b for s, b in datasets.items() if s != safe}, opts)
-    if a.only != "trend":
+    stocks = {s: b for s, b in datasets.items() if s != safe}
+    if a.only in (None, "pullback"):
+        run_pullback(stocks, opts)
+    if a.only in (None, "trend"):
+        run_trend(stocks, opts)
+    if a.only in (None, "rotation"):
         run_rotation(datasets, safe, opts)
     print("\n※ 과거 성과가 미래 수익을 보장하지 않습니다. 최대낙폭은 '가장 많이 빠졌을 때'라 함께 보세요.")
 

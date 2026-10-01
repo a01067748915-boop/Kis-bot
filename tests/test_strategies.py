@@ -45,3 +45,32 @@ def test_rotation_picks_leader_monthly_and_goes_safe():
 def test_summary_drawdown():
     r = summary([1.0, 1.2, 0.9, 1.1])
     assert r["낙폭"] == pytest.approx(-25.0) and r["수익"] == pytest.approx(10.0)
+
+
+def test_rsi_extremes():
+    from strategies import rsi
+    assert rsi([1, 2, 3, 4])[3] == 100.0
+    assert rsi([4, 3, 2, 1])[3] == pytest.approx(0.0)
+
+
+def test_pullback_buys_dip_sells_on_recovery_with_costs():
+    from strategies import pullback
+    closes = [50 + i * 2 for i in range(30)] + [100, 94, 96, 104, 108, 110]  # 20일선 위 눌림
+    bars = [bar(f"d{i:02d}", c, c) for i, c in enumerate(closes)]
+    curve, trades, start = pullback(bars, rsi_max=10, trend_ma=20, fee_pct=0, slip_pct=0)
+    assert len(trades) == 1
+    ret, days, i = trades[0]
+    # 94 급락(RSI<10) → 다음날 시가 96 매수 → 104 가 5일선 회복 → 다음날 시가 108 매도
+    assert ret == pytest.approx(108 / 96 - 1) and days == 2
+    _, costly, _ = pullback(bars, rsi_max=10, trend_ma=20, fee_pct=0.25, slip_pct=0.05)
+    assert costly[0][0] < ret
+
+
+def test_pullback_stop_loss():
+    from strategies import pullback
+    closes = [50 + i * 2 for i in range(30)] + [100, 94]
+    bars = [bar(f"d{i:02d}", c, c) for i, c in enumerate(closes)]
+    bars.append({"date": "x", "open": 96, "high": 96, "low": 85, "close": 90})  # 매수 당일 -8% 이탈
+    bars.append(bar("y", 90, 90))
+    _, trades, _ = pullback(bars, rsi_max=10, trend_ma=20, stop_pct=8, fee_pct=0, slip_pct=0)
+    assert trades[0][0] == pytest.approx(-0.08)
