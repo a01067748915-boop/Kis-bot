@@ -28,6 +28,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from backtest import fetch_bars, load_csv
+from signals import indicators, rsi
 
 HERE = Path(__file__).resolve().parent
 
@@ -118,22 +119,6 @@ def run_trend(datasets, opts):
 
 
 # ─── A. 눌림목 매수 ───────────────────────────────────
-def rsi(closes, n=2):
-    """와일더 방식 RSI. 앞쪽 n개는 None"""
-    out = [None] * len(closes)
-    if len(closes) <= n:
-        return out
-    gains = [max(closes[i] - closes[i - 1], 0) for i in range(1, len(closes))]
-    losses = [max(closes[i - 1] - closes[i], 0) for i in range(1, len(closes))]
-    ag, al = sum(gains[:n]) / n, sum(losses[:n]) / n
-    for i in range(n, len(closes)):
-        if i > n:
-            ag = (ag * (n - 1) + gains[i - 1]) / n
-            al = (al * (n - 1) + losses[i - 1]) / n
-        out[i] = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
-    return out
-
-
 def pullback(bars, rsi_max=10, trend_ma=200, exit_ma=5, max_days=10, stop_pct=None, fee_pct=0.25, slip_pct=0.05):
     """눌림목 매수 1종목 시뮬레이션 → (자산곡선, 거래목록[(수익률, 보유일, 진입 인덱스)], 시작 인덱스)
     수익률은 매수·매도 수수료와 슬리피지를 모두 뺀 값
@@ -218,20 +203,6 @@ def run_pullback(datasets, opts):
 
 
 # ─── A'. 눌림목 매수 — 예산을 모아 쓰는 포트폴리오 ─────
-def indicators(bars, trend_ma=200, exit_ma=5):
-    """날짜별 {close, rsi, trend(종가>추세선), recovered(종가>단기선)} — 그날 종가까지로 계산"""
-    closes = [b["close"] for b in bars]
-    r = rsi(closes, 2)
-    out = {}
-    for i, b in enumerate(bars):
-        if i + 1 < max(trend_ma, exit_ma) or r[i] is None:
-            continue
-        trend = not trend_ma or closes[i] > sum(closes[i + 1 - trend_ma:i + 1]) / trend_ma
-        out[b["date"]] = {"rsi": r[i], "trend": trend,
-                          "recovered": closes[i] > sum(closes[i + 1 - exit_ma:i + 1]) / exit_ma}
-    return out
-
-
 def portfolio(datasets, budget=950.0, slots=2, rsi_max=10, trend_ma=200, max_days=10,
               fee_pct=0.25, slip_pct=0.05, whole_shares=True):
     """예산 하나를 slots 칸으로 나눠, 신호 난 종목 중 RSI가 가장 낮은 것부터 채움

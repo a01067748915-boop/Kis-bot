@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 DIR="$(pwd)"
 BRANCH="${BRANCH:-claude/implementable-features-sq6aav}"
 BASE="https://raw.githubusercontent.com/a01067748915-boop/Kis-bot/${BRANCH}"
-FILES="bot.py kis_api.py check.py backtest.py setup.sh requirements.txt .env.example .gitignore"
+FILES="bot.py kis_api.py signals.py check.py backtest.py strategies.py setup.sh requirements.txt .env.example .gitignore"
 UNIT=/etc/systemd/system/kisbot.service
 BACKUP="${DIR}/backup/$(date +%Y%m%d-%H%M%S)"
 
@@ -62,7 +62,7 @@ echo "▶ 최신 코드 받기 (${BRANCH})"
 for f in $FILES; do
   curl -fsSL "$BASE/$f" -o "$TMP/$f" || abort "$f 다운로드 실패"
 done
-python3 -m py_compile "$TMP"/bot.py "$TMP"/kis_api.py "$TMP"/check.py "$TMP"/backtest.py \
+python3 -m py_compile "$TMP"/*.py \
   || abort "받은 코드가 손상됨"
 for f in $FILES; do cp "$TMP/$f" "$f"; done
 chmod +x setup.sh

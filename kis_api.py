@@ -10,6 +10,7 @@
 import json
 import os
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
@@ -174,6 +175,22 @@ class KIS:
             except (TypeError, ValueError):
                 continue
         return sorted(bars, key=lambda x: x["date"])
+
+    def daily_history(self, sym, ex, count=260):
+        """최근 일봉 count개 이상(가능한 만큼) — 100개씩 과거로 이어 붙임. 오래된 순"""
+        bars, base = {}, ""
+        for _ in range(count // 100 + 2):
+            chunk = self.daily_bars(sym, ex, base)
+            new = [b for b in chunk if b["date"] not in bars]
+            if not new:
+                break
+            for b in new:
+                bars[b["date"]] = b
+            if len(bars) >= count:
+                break
+            oldest = datetime.strptime(chunk[0]["date"], "%Y%m%d")
+            base = (oldest - timedelta(days=1)).strftime("%Y%m%d")
+        return [bars[d] for d in sorted(bars)]
 
     # ─── 계좌 ─────────────────────────────────────────
     def holdings(self, ex="NAS"):

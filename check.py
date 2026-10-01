@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 from bot import ET, Config, Telegram, secure_files, security_warnings, usd
 from kis_api import KIS
+from signals import indicators
 
 HERE = Path(__file__).resolve().parent
 warnings = secure_files()
@@ -22,19 +23,32 @@ if (HERE / ".git").exists():
         warnings.append(f"{tracked} 이(가) git에 올라가 있습니다 — 키를 재발급하고 git rm --cached 하세요")
 for w in warnings + security_warnings(cfg):
     print(f"🔐 {w}")
-print(f"환경: {cfg.env} / DRY_RUN: {cfg.dry_run} / 예산 {usd(cfg.budget)} / 종목당 {usd(cfg.alloc)}"
-      f" / 청산: {cfg.exit_mode}")
+if cfg.strategy == "pullback":
+    plan = f"전략: 눌림목 / 칸당 {usd(cfg.alloc)} × {cfg.slots}칸 / RSI<{cfg.rsi_max:g}"
+else:
+    plan = f"전략: 돌파 / 종목당 {usd(cfg.alloc)} / 청산: {cfg.exit_mode}"
+print(f"환경: {cfg.env} / DRY_RUN: {cfg.dry_run} / 예산 {usd(cfg.budget)} / {plan}")
 print(f"뉴욕 현재시각: {datetime.now(ET):%Y-%m-%d %H:%M}")
 
 api = KIS(cfg.env, os.environ["KIS_APP_KEY"], os.environ["KIS_APP_SECRET"], os.environ["KIS_ACCOUNT"], HERE)
 for sym, ex in cfg.targets.items():
     try:
         p = api.price(sym, ex)
-        bars = api.daily_bars(sym, ex)
+        if cfg.strategy == "pullback":
+            bars = api.daily_history(sym, ex, cfg.trend_ma + 60)
+        else:
+            bars = api.daily_bars(sym, ex)
         qty = math.floor(cfg.alloc / (p * (1 + cfg.limit_slip_pct / 100)))
         last = bars[-1]["date"] if bars else "없음"
         warn = "" if qty > 0 else "  ⚠️ 배정액으로 1주도 못 삼 → 종목 변경 필요"
-        print(f"✅ {sym}({ex}) 현재가 {usd(p)}, 일봉 {len(bars)}개(최근 {last}), 매수가능 {qty}주{warn}")
+        sig = ""
+        if cfg.strategy == "pullback":
+            ind = indicators(bars, cfg.trend_ma, cfg.exit_ma).get(last) if bars else None
+            if ind:
+                sig = f", RSI(2) {ind['rsi']:.1f}{' · 200일선 위' if ind['trend'] else ' · 200일선 아래'}"
+            else:
+                warn += f"  ⚠️ 일봉 {len(bars)}개로는 {cfg.trend_ma}일선 계산 불가"
+        print(f"✅ {sym}({ex}) 현재가 {usd(p)}, 일봉 {len(bars)}개(최근 {last}), 매수가능 {qty}주{sig}{warn}")
     except Exception as e:
         print(f"❌ {sym}({ex}) 실패: {e}")
 

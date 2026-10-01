@@ -400,3 +400,122 @@ def test_next_open_holiday_keeps_position(make):
 def test_bad_exit_mode_rejected():
     with pytest.raises(ValueError):
         Config({"EXIT_MODE": "tomorrow"})
+
+
+# ─── 눌림목 매수 (STRATEGY=pullback) ───
+def pb_hist(today, drop=0.0, bounce=False, n=260):
+    """꾸준한 상승(200일선 위) 뒤 전날 drop 비율만큼 급락(RSI↓) 또는 bounce(5일선 위 회복) + 오늘 봉"""
+    closes = [50 + i * 0.5 for i in range(n)]
+    if drop:
+        closes[-1] = closes[-2] * (1 - drop)
+    if bounce:
+        closes[-3] = closes[-4] * 0.9
+        closes[-1] = closes[-4] * 1.05
+    bars = [{"date": f"2025{i:04d}", "open": c, "high": c, "low": c, "close": c} for i, c in enumerate(closes)]
+    return bars + [{"date": today, "open": closes[-1], "high": closes[-1], "low": closes[-1], "close": closes[-1]}]
+
+
+@pytest.fixture
+def pb(make):
+    def _pb(**env):
+        b, api, tg = make(**{"STRATEGY": "pullback", "TARGETS": "AAA:NAS,BBB:NAS,CCC:NAS", "SLOTS": "2",
+                             "DAILY_LOSS_LIMIT_PCT": "0", **env})
+        api.prices = {"AAA": 100.0, "BBB": 100.0, "CCC": 100.0}
+        api.hist = {s: pb_hist(TODAY) for s in api.prices}
+        api.daily_history = lambda sym, ex, count=260: api.hist[sym]
+        return b, api, tg
+    return _pb
+
+
+def test_pullback_fills_slots_by_lowest_rsi(pb):
+    b, api, tg = pb()
+    api.hist["AAA"] = pb_hist(TODAY, drop=0.06)
+    api.hist["BBB"] = pb_hist(TODAY, drop=0.10)   # 더 깊이 빠짐 → RSI 더 낮음
+    api.hist["CCC"] = pb_hist(TODAY, drop=0.08)
+    b.step(at(9, 30))
+    assert not b.state["prepared"]                 # 09:35 전에는 대기
+    b.step(at(9, 40))
+    plans = b.state["plans"]
+    assert all(plans[s]["buy"] for s in plans) and plans["BBB"]["rsi"] < plans["CCC"]["rsi"] < plans["AAA"]["rsi"]
+    assert set(b.state["positions"]) == {"BBB", "CCC"}  # 2칸, RSI 낮은 순
+    assert b.state["positions"]["BBB"]["qty"] == 4      # 1000/2칸=500 → 100달러짜리 4주
+    assert journal(b)[0]["reason"].startswith("눌림목 RSI")
+
+
+def test_pullback_holds_overnight_then_sells_on_recovery(pb):
+    b, api, tg = pb()
+    api.hist["AAA"] = pb_hist(TODAY, drop=0.10)
+    b.step(at(9, 40))
+    b.step(at(16, 0))
+    assert "AAA" in b.state["positions"] and any("보유 유지" in m for m in tg.sent)
+    tue = datetime(2026, 1, 6, 9, 40, tzinfo=ET)
+    api.hist["AAA"] = pb_hist("20260106", drop=0.02)  # 전날 종가가 5일선 아래 → 유지
+    b.step(tue)
+    assert b.state["positions"]["AAA"]["days"] == 1 and "AAA" in b.state["positions"]
+    wed = datetime(2026, 1, 7, 9, 40, tzinfo=ET)
+    api.hist["AAA"] = pb_hist("20260107", bounce=True)
+    api.prices["AAA"] = 105
+    b.step(wed)
+    assert "AAA" not in b.state["positions"]
+    assert journal(b)[-1]["reason"] == "5일선 회복" and float(journal(b)[-1]["pnl"]) > 0
+
+
+def test_pullback_max_hold_days(pb):
+    b, api, tg = pb(MAX_HOLD_DAYS="2")
+    b.state = b._fresh("20260102")
+    b.state["positions"] = {"AAA": {"qty": 3, "entry": 100.0, "ex": "NAS", "days": 1}}
+    api.hist["AAA"] = pb_hist(TODAY, drop=0.02)    # 회복 안 됨
+    b.step(at(9, 40))
+    assert "AAA" not in b.state["positions"]
+    assert journal(b)[0]["reason"] == "최대 보유 2일"
+
+
+def test_pullback_no_buy_below_trend_or_when_paused(pb):
+    b, api, tg = pb()
+    down = pb_hist(TODAY, drop=0.10)
+    for bar_ in down[:-2]:
+        bar_["close"] = 400 - bar_["close"]           # 하락 추세 → 200일선 아래
+    api.hist["AAA"] = down
+    tg.queue = ["/pause"]
+    api.hist["BBB"] = pb_hist(TODAY, drop=0.10)
+    b.step(at(9, 40))
+    assert not b.state["plans"]["AAA"]["buy"]
+    assert not b.state["positions"]                  # BBB 신호 있지만 /pause
+
+
+def test_pullback_holiday_does_not_count_day(pb):
+    b, api, tg = pb()
+    b.state = b._fresh("20260102")
+    b.state["positions"] = {"AAA": {"qty": 3, "entry": 100.0, "ex": "NAS", "days": 1}}
+    api.hist = {s: pb_hist(TODAY)[:-1] for s in api.prices}  # 오늘 봉 없음 = 휴장
+    b.step(at(9, 40))
+    assert b.state["skip_day"] and b.state["positions"]["AAA"]["days"] == 1
+
+
+def test_pullback_daily_loss_uses_previous_close(pb):
+    b, api, tg = pb(DAILY_LOSS_LIMIT_PCT="5")       # 한도 50달러
+    b.state = b._fresh("20260102")
+    b.state["positions"] = {"AAA": {"qty": 4, "entry": 150.0, "ex": "NAS", "days": 1}}
+    api.hist["AAA"] = pb_hist(TODAY, drop=0.02)       # 전날 종가 약 175.4, 5일선 아래라 보유 유지
+    api.prices["AAA"] = 170.0                         # 매수가보다 높지만 전날 대비 약 -22달러 → 한도 안
+    b.step(at(9, 40))
+    assert not b.state["halted"] and "AAA" in b.state["positions"]
+    api.prices["AAA"] = 160.0                         # 전날 대비 약 -62달러 → 한도 초과
+    b.step(at(9, 41))
+    assert b.state["halted"] and not b.state["positions"]
+
+
+def test_kis_daily_history_pages_back(tmp_path):
+    api = KIS("real", "k", "s", "12345678-01", tmp_path)
+    days = [f"2025{m:02d}{d:02d}" for m in range(1, 13) for d in range(1, 29)]  # 336일
+    calls = []
+
+    def daily_bars(sym, ex, base_date=""):
+        calls.append(base_date)
+        upto = [d for d in days if not base_date or d <= base_date]
+        return [{"date": d, "open": 1, "high": 1, "low": 1, "close": 1} for d in upto[-100:]]
+
+    api.daily_bars = daily_bars
+    bars = api.daily_history("X", "NAS", 260)
+    assert len(bars) >= 260 and bars == sorted(bars, key=lambda b: b["date"])
+    assert len(calls) == 3 and calls[0] == ""
