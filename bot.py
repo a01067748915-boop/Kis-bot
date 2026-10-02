@@ -610,7 +610,7 @@ class Bot:
 
 
 # ─── 보안 ─────────────────────────────────────────────
-SECRET_KEYS = ("KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT", "TELEGRAM_TOKEN")
+SECRET_KEYS = ("KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT", "TELEGRAM_TOKEN", "ALPACA_KEY_ID", "ALPACA_SECRET_KEY")
 
 
 class RedactSecrets(logging.Filter):
