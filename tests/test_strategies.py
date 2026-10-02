@@ -90,7 +90,7 @@ def test_portfolio_fills_slots_by_lowest_rsi_and_whole_shares():
     kw = dict(rsi_max=20, trend_ma=20, fee_pct=0, slip_pct=0)
     one = portfolio(data, budget=1000, slots=1, **kw)
     # 같은 날 A·B 신호 → 더 깊이 빠진(RSI 낮은) B 를 117에 사서 149에 팖(A는 칸이 없어 건너뜀), 이후 C 135→161
-    assert [round(t, 4) for t, _ in one["trades"]] == [round(149 / 117 - 1, 4), round(161 / 135 - 1, 4)]
+    assert [round(t[0], 4) for t in one["trades"]] == [round(149 / 117 - 1, 4), round(161 / 135 - 1, 4)]
     two = portfolio(data, budget=1000, slots=2, **kw)
     assert len(two["trades"]) == 3  # 칸이 2개면 A도 삼
     poor = portfolio(data, budget=50, slots=2, **kw)  # 칸 예산 25달러로는 1주도 못 삼
@@ -137,3 +137,17 @@ def test_portfolio_market_filters_gate_entries():
     # 시장 과매도(계속 하락 → RSI 0): 종목 RSI 기준 없이 200일선 위 종목을 삼
     r = portfolio(data, market=market_indicators(down, trend_ma=20), mfilter="mrsi", **kw)
     assert len(r["trades"]) >= len(base["trades"])
+
+
+def test_portfolio_late_symbol_joins_and_expensive_skipped():
+    from strategies import portfolio
+    base = {"A": _dip_series(30, 16), "B": _dip_series(30, 22)}
+    late = _dip_series(34, 16)[10:]                     # 10일 늦게 시작 → 지표 준비도 늦음
+    pricey = [dict(b, open=b["open"] * 100, close=b["close"] * 100, high=b["high"] * 100, low=b["low"] * 100)
+              for b in _dip_series(30, 22)]
+    kw = dict(budget=1000, slots=3, rsi_max=20, trend_ma=20, fee_pct=0, slip_pct=0)
+    ref = portfolio(base, **kw)
+    r = portfolio({**base, "L": late, "P": pricey}, start=ref["dates"][0], **kw)
+    assert r["dates"][0] == ref["dates"][0]             # 늦은 종목 때문에 기간이 줄지 않음
+    traded = {t[2] for t in r["trades"]}
+    assert {"A", "B"} <= traded and "P" in r["skipped"]

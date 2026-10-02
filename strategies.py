@@ -204,30 +204,40 @@ def run_pullback(datasets, opts):
 
 # ─── A'. 눌림목 매수 — 예산을 모아 쓰는 포트폴리오 ─────
 def portfolio(datasets, budget=950.0, slots=2, rsi_max=10, trend_ma=200, max_days=10,
-              fee_pct=0.25, slip_pct=0.05, whole_shares=True, market=None, mfilter=None, mrsi_max=10):
+              fee_pct=0.25, slip_pct=0.05, whole_shares=True, market=None, mfilter=None, mrsi_max=10,
+              start=None):
     """예산 하나를 slots 칸으로 나눠, 신호 난 종목 중 RSI가 가장 낮은 것부터 채움
     market: market_indicators() 결과(날짜별), mfilter: 시장 필터
       "trend" 시장이 200일선 위일 때만 매수 / "panic" 최근 3일 안에 투매(하락+거래량 급증)가 있을 때만
       "mrsi"  시장 RSI(2) < mrsi_max 일 때만, 종목 RSI 기준 없이 200일선 위 종목 중 RSI 낮은 순
-    → {"dates", "curve"(달러), "trades"[(수익률, 보유일)], "used"(평균 사용 칸 비율), "open_days"(매수 허용일 비율)}"""
+    start: 시작일(YYYYMMDD). 없으면 모든 종목 지표가 준비된 첫날. 시작 뒤 상장·지표 준비된 종목은 그때부터 참여
+    → {"dates", "curve"(달러), "trades"[(수익률, 보유일, 종목)], "used"(평균 사용 칸 비율),
+       "open_days"(매수 허용일 비율), "skipped"(신호는 났지만 1주 가격이 칸보다 비싸 못 산 종목)}"""
     fee, slip = fee_pct / 100, slip_pct / 100
     ind = {s: indicators(b, trend_ma) for s, b in datasets.items()}
     px = {s: by_date(b) for s, b in datasets.items()}
-    common = sorted(set.intersection(*(set(v) for v in px.values())))
-    prev_of = dict(zip(common[1:], common))
-    dates = [d for d in common[1:] if all(prev_of[d] in ind[s] for s in ind)  # 지표가 다 준비된 날부터
-             and (market is None or prev_of[d] in market)]
-    cash, pos, curve, trades, used, open_days = budget, {}, [], [], 0, 0
+    cal = sorted(set().union(*(set(v) for v in px.values())))
+    prev_of = dict(zip(cal[1:], cal))
+
+    def ready(s, d):  # 오늘 시세가 있고 전날 지표가 준비됨
+        return d in px[s] and prev_of.get(d) in ind[s]
+
+    if start is None:
+        start = next((d for d in cal[1:] if all(ready(s, d) for s in px)), None)
+    dates = [d for d in cal[1:] if start and d >= start and (market is None or prev_of[d] in market)]
+    cash, pos, curve, trades, used, open_days, last, skipped = budget, {}, [], [], 0, 0, {}, set()
     for d in dates:
         y = prev_of[d]
-        # 1) 매도: 전날 종가가 단기선 위로 회복했거나 최대 보유일 도달 → 오늘 시가
+        # 1) 매도: 전날 종가가 단기선 위로 회복했거나 최대 보유일 도달 → 오늘 시가 (거래정지 등 시세 없는 날은 보류)
         for s in list(pos):
             p = pos[s]
             p["days"] += 1
+            if not ready(s, d):
+                continue
             if ind[s][y]["recovered"] or p["days"] >= max_days:
                 got = p["qty"] * px[s][d]["open"] * (1 - slip) * (1 - fee)
                 cash += got
-                trades.append((got / p["cost"] - 1, p["days"]))
+                trades.append((got / p["cost"] - 1, p["days"], s))
                 del pos[s]
         # 2) 매수: 빈 칸만큼, 전날 RSI 낮은 순 (시장 필터가 막으면 쉼)
         m = market[y] if market is not None else None
@@ -235,9 +245,9 @@ def portfolio(datasets, budget=950.0, slots=2, rsi_max=10, trend_ma=200, max_day
                  or (mfilter == "panic" and m["panic_recent"]) or (mfilter == "mrsi" and m["rsi"] < mrsi_max))
         open_days += allow
         limit = 101 if mfilter == "mrsi" else rsi_max
-        equity_open = cash + sum(p["qty"] * px[s][d]["open"] for s, p in pos.items())
-        cands = [] if not allow else sorted((ind[s][y]["rsi"], s) for s in ind
-                                            if s not in pos and ind[s][y]["trend"] and ind[s][y]["rsi"] < limit)
+        equity_open = cash + sum(p["qty"] * (px[s][d]["open"] if d in px[s] else last[s]) for s, p in pos.items())
+        cands = [] if not allow else sorted((ind[s][y]["rsi"], s) for s in ind if s not in pos and ready(s, d)
+                                            and ind[s][y]["trend"] and ind[s][y]["rsi"] < limit)
         for _, s in cands:
             if len(pos) >= slots:
                 break
@@ -245,14 +255,19 @@ def portfolio(datasets, budget=950.0, slots=2, rsi_max=10, trend_ma=200, max_day
             alloc = min(equity_open / slots, cash)
             qty = int(alloc * (1 - fee) / price) if whole_shares else alloc * (1 - fee) / price
             if qty <= 0:
+                skipped.add(s)
                 continue  # 1주도 못 사면 다음 후보
             cost = qty * price / (1 - fee)
             cash -= cost
             pos[s] = {"qty": qty, "cost": cost, "days": 0}
         used += len(pos)
-        curve.append(cash + sum(p["qty"] * px[s][d]["close"] for s, p in pos.items()))
+        for s in px:
+            if d in px[s]:
+                last[s] = px[s][d]["close"]
+        curve.append(cash + sum(p["qty"] * last[s] for s, p in pos.items()))
     n = max(1, len(dates))
-    return {"dates": dates, "curve": curve, "trades": trades, "used": used / n / slots, "open_days": open_days / n}
+    return {"dates": dates, "curve": curve, "trades": trades, "used": used / n / slots, "open_days": open_days / n,
+            "skipped": skipped - {t[2] for t in trades}}
 
 
 PORTFOLIO_VARIANTS = [  # (이름, slots, rsi_max)
@@ -276,8 +291,8 @@ def yearly(dates, curve, start_value):
 def print_portfolio_row(name, r, budget):
     t = r["trades"]
     n = len(t)
-    avg = sum(x for x, _ in t) / n * 100 if n else 0
-    win = sum(x > 0 for x, _ in t) / n * 100 if n else 0
+    avg = sum(x[0] for x in t) / n * 100 if n else 0
+    win = sum(x[0] > 0 for x in t) / n * 100 if n else 0
     print(f"  {name:<11}: {fmt(summary([v / budget for v in r['curve']]))}, 매매 {n}회,"
           f" 승률 {win:.0f}%, 1회평균 {avg:+.2f}%, 투자비율 {r['used'] * 100:.0f}%")
     print(f"     연도별   : {yearly(r['dates'], r['curve'], budget)}  → 최종 {usd(r['curve'][-1])}")
@@ -304,6 +319,41 @@ def run_market_filters(datasets, opts, budget, market_name, market_bars, slots=2
         print_portfolio_row(name, r, budget)
         if f:
             print(f"     매수 허용일 {r['open_days'] * 100:.0f}%")
+
+
+UNIVERSE_VARIANTS = [  # (이름, slots, rsi_max)
+    ("2칸 RSI<10", 2, 10), ("3칸 RSI<10", 3, 10), ("4칸 RSI<10", 4, 10), ("3칸 RSI<5", 3, 5),
+]
+
+
+def run_universe(base, extra, opts, budget):
+    """기존 종목 vs 종목 추가 — 같은 시작일로 비교"""
+    allset = {**base, **extra}
+    ref = portfolio(base, budget, slots=2, **opts)
+    if not ref["dates"]:
+        print("  기존 종목 데이터 부족")
+        return
+    start = ref["dates"][0]
+    print(f"\n━━ 종목 수 비교: 기존 {len(base)}개 vs 추가 후 {len(allset)}개 (같은 시작일 {start}) ━━")
+    print(f"  추가: {', '.join(extra)}")
+    late = [s for s, b in extra.items() if b and b[0]["date"] > start]
+    if late:
+        print(f"  ※ 시작일 뒤 상장·데이터 시작이라 중간부터 참여: {', '.join(late)}")
+    print_portfolio_row(f"기존{len(base)} 2칸", ref, budget)
+    for name, slots, rmax in UNIVERSE_VARIANTS:
+        r = portfolio(allset, budget, slots=slots, rsi_max=rmax, start=start, **opts)
+        print_portfolio_row(f"{len(allset)}개 {name}", r, budget)
+        if r["skipped"]:
+            print(f"     칸 예산보다 비싸 한 번도 못 산 종목: {', '.join(sorted(r['skipped']))}")
+    best = portfolio(allset, budget, slots=3, rsi_max=10, start=start, **opts)
+    by_sym = {}
+    for ret, _, sym in best["trades"]:
+        n, tot = by_sym.get(sym, (0, 0.0))
+        by_sym[sym] = (n + 1, tot + ret)
+    if by_sym:
+        ranked = sorted(by_sym.items(), key=lambda x: -x[1][1])
+        print("  종목별 기여 (3칸 RSI<10, 누적 수익률 합): "
+              + ", ".join(f"{k} {t * 100:+.0f}%({n})" for k, (n, t) in ranked))
 
 
 def run_portfolio(datasets, opts, budget):
@@ -379,6 +429,7 @@ def main():
     p.add_argument("--years", type=int, default=5)
     p.add_argument("--targets", help="종목, 예: QQQM:NAS,SOXX:NAS,SCHD:AMS (기본: .env 의 TARGETS)")
     p.add_argument("--safe", help="③ 대피처 종목, 예: SGOV:AMS (없으면 현금)")
+    p.add_argument("--add", help="portfolio 종목 수 비교: 기존 --targets 에 더할 종목, 예: NVDA:NAS,TSLA:NAS")
     p.add_argument("--market", default="SPY:AMS",
                    help="portfolio 시장 필터 기준 종목 (기본 SPY:AMS, none=비교 생략)")
     p.add_argument("--only", choices=["pullback", "portfolio", "trend", "rotation"], help="한 전략만 실행")
@@ -390,7 +441,7 @@ def main():
     g = os.environ.get
     opts = {"fee_pct": a.fee if a.fee is not None else float(g("FEE_PCT", "0.25")), "slip_pct": 0.05}
     safe, market_name, market_bars = None, None, None
-    use_market = a.only in (None, "portfolio") and a.market.lower() != "none"
+    use_market = a.only in (None, "portfolio") and a.market.lower() != "none" and not a.add
     if use_market:
         market_name = a.market.split(":")[0].upper()
     if a.csv:
@@ -412,6 +463,15 @@ def main():
             if not datasets[sym]:
                 print(f"  ⚠️ {sym}({ex}) 시세 없음 — 거래소 코드를 확인하세요")
                 datasets.pop(sym)
+        extra = {}
+        for sym, ex in (parse_targets(a.add) if a.add else {}).items():
+            if sym in datasets:
+                continue
+            print(f"{sym} 일봉 수집 중… (추가 종목)")
+            extra[sym] = fetch_bars(api, sym, ex, a.years)
+            if not extra[sym]:
+                print(f"  ⚠️ {sym}({ex}) 시세 없음 — 거래소 코드를 확인하세요 (제외)")
+                extra.pop(sym)
         if use_market:
             print(f"{market_name} 일봉 수집 중… (시장 필터용)")
             sym, ex = next(iter(parse_targets(a.market).items()))
@@ -419,6 +479,10 @@ def main():
 
     print(f"\n수수료 편도 {opts['fee_pct']}%, 슬리피지 {opts['slip_pct']}%")
     stocks = {s: b for s, b in datasets.items() if s != safe}
+    if a.add and not a.csv:
+        run_universe(stocks, extra, opts, float(g("BUDGET_USD", "950")))
+        print("\n※ 과거 성과가 미래 수익을 보장하지 않습니다.")
+        return
     if a.only in (None, "pullback"):
         run_pullback(stocks, opts)
     if a.only in (None, "portfolio"):
