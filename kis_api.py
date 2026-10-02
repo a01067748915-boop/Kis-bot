@@ -10,7 +10,6 @@
 import json
 import os
 import time
-from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
@@ -185,21 +184,30 @@ class KIS:
                 continue
         return sorted(bars, key=lambda x: x["date"])
 
-    def daily_history(self, sym, ex, count=260):
-        """최근 일봉 count개 이상(가능한 만큼) — 100개씩 과거로 이어 붙임. 오래된 순"""
-        bars, base = {}, ""
-        for _ in range(count // 100 + 2):
+    def daily_history(self, sym, ex, count=260, since=None):
+        """최근 일봉 count개 이상 또는 since(YYYYMMDD)까지 — 100개씩 과거로 이어 붙임. 오래된 순
+        조각마다 수정주가 기준일이 달라 분할(10:1 등) 전후 가격이 어긋날 수 있어,
+        하루씩 겹치게 받아 겹친 날 종가가 같도록 오래된 조각을 비율로 맞춤"""
+        bars, base = [], ""
+        for _ in range(500):
             chunk = self.daily_bars(sym, ex, base)
-            new = [b for b in chunk if b["date"] not in bars]
-            if not new:
+            if not bars:
+                older = chunk
+            else:
+                first = bars[0]
+                older = [b for b in chunk if b["date"] < first["date"]]
+                same = next((b for b in chunk if b["date"] == first["date"]), None)
+                if same and same["close"] > 0 and abs(first["close"] / same["close"] - 1) > 1e-6:
+                    f = first["close"] / same["close"]
+                    older = [{**b, "open": b["open"] * f, "high": b["high"] * f, "low": b["low"] * f,
+                              "close": b["close"] * f, "volume": b.get("volume", 0) / f} for b in older]
+            if not older:
                 break
-            for b in new:
-                bars[b["date"]] = b
-            if len(bars) >= count:
+            bars = older + bars
+            if (count and not since and len(bars) >= count) or (since and bars[0]["date"] <= since):
                 break
-            oldest = datetime.strptime(chunk[0]["date"], "%Y%m%d")
-            base = (oldest - timedelta(days=1)).strftime("%Y%m%d")
-        return [bars[d] for d in sorted(bars)]
+            base = bars[0]["date"]  # 그날까지 포함해 다시 조회 → 하루 겹침
+        return [b for b in bars if not since or b["date"] >= since]
 
     # ─── 계좌 ─────────────────────────────────────────
     def holdings(self, ex="NAS"):

@@ -76,6 +76,16 @@ def usd(x):
     return f"${x:,.0f}"
 
 
+def warn_jumps(sym, bars, limit=0.45):
+    """하루에 -45% 이하나 +80% 이상 움직인 날 — 실제 폭락일 수도, 분할 미반영 데이터일 수도 있어 표시"""
+    jumps = [(b["date"], b["close"] / a["close"] - 1) for a, b in zip(bars, bars[1:])
+             if a["close"] > 0 and not (1 - limit < b["close"] / a["close"] < 1 / (1 - limit))]
+    if jumps:
+        print(f"  ⚠️ {sym} 하루 급변 {len(jumps)}회: "
+              + ", ".join(f"{d} {r * 100:+.0f}%" for d, r in jumps[:4]) + " — 분할 미반영인지 확인 필요")
+    return jumps
+
+
 def by_date(bars):
     return {b["date"]: b for b in bars}
 
@@ -492,6 +502,8 @@ def main():
             if not datasets[sym]:
                 print(f"  ⚠️ {sym}({ex}) 시세 없음 — 거래소 코드를 확인하세요")
                 datasets.pop(sym)
+                continue
+            warn_jumps(sym, datasets[sym])
         extra = {}
         for sym, ex in (parse_targets(a.add) if a.add else {}).items():
             if sym in datasets:
@@ -501,6 +513,8 @@ def main():
             if not extra[sym]:
                 print(f"  ⚠️ {sym}({ex}) 시세 없음 — 거래소 코드를 확인하세요 (제외)")
                 extra.pop(sym)
+                continue
+            warn_jumps(sym, extra[sym])
         if use_market:
             print(f"{market_name} 일봉 수집 중… (시장 필터용)")
             sym, ex = next(iter(parse_targets(a.market).items()))

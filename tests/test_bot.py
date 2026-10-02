@@ -567,3 +567,27 @@ def test_report_recovers_trades_from_bot_log(tmp_path):
     assert rows[0]["price"] == 15.72 and rows[1]["pnl"] == 9.05 and rows[2]["price"] == 1180.10
     assert rows[2]["reason"] == "눌림목 RSI 4.3" and rows[3]["reason"] == "최대 보유 10일"
     assert report.stats(report.pick(rows, real=True))["total"] == 9.05
+
+
+def test_kis_daily_history_stitches_split_adjustment(tmp_path):
+    """조회 기준일마다 수정주가 기준이 달라도(기준일 이전 분할만 반영) 이어 붙인 결과가 연속이어야 함"""
+    api = KIS("real", "k", "s", "12345678-01", tmp_path)
+    n, split = 330, 120                         # 120번째 날 10:1 분할
+    days = [f"D{i:04d}" for i in range(n)]
+    adj = [10 * 1.001 ** i for i in range(n)]   # 현재 기준 수정주가(정답)
+
+    def daily_bars(sym, ex, base_date=""):
+        b = n - 1 if not base_date else days.index(base_date)   # 기준일 포함
+        lo = max(0, b - 99)
+        out = []
+        for i in range(lo, b + 1):
+            unadj = b < split and i < split      # 기준일이 분할 전이면 분할 미반영
+            px = adj[i] * (10 if unadj else 1)
+            out.append({"date": days[i], "open": px, "high": px, "low": px, "close": px, "volume": 100})
+        return out
+
+    api.daily_bars = daily_bars
+    bars = api.daily_history("X", "NAS", since="D0000")
+    assert [b["date"] for b in bars] == days
+    assert max(abs(b["close"] / a - 1) for b, a in zip(bars, adj)) < 1e-9
+    assert bars[0]["volume"] == pytest.approx(1000)  # 가격을 1/10로 맞추면 주식 수 기준 거래량은 10배

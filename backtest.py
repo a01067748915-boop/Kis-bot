@@ -30,21 +30,9 @@ HERE = Path(__file__).resolve().parent
 
 
 def fetch_bars(api, sym, ex, years):
-    """KIS 미국 일봉을 100일 단위로 과거로 거슬러 수집"""
+    """KIS 미국 일봉 최근 years년 (100일 단위로 이어 붙이며 분할 기준 차이 보정)"""
     limit = (datetime.now() - timedelta(days=365 * years)).strftime("%Y%m%d")
-    bars, base = {}, ""
-    while True:
-        chunk = api.daily_bars(sym, ex, base)
-        new = [b for b in chunk if b["date"] not in bars]
-        if not new:
-            break
-        for b in new:
-            bars[b["date"]] = b
-        oldest = chunk[0]["date"]
-        if oldest <= limit:
-            break
-        base = (datetime.strptime(oldest, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
-    return [bars[d] for d in sorted(bars) if d >= limit]
+    return api.daily_history(sym, ex, since=limit)
 
 
 def load_csv(path):
