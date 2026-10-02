@@ -151,3 +151,22 @@ def test_portfolio_late_symbol_joins_and_expensive_skipped():
     assert r["dates"][0] == ref["dates"][0]             # 늦은 종목 때문에 기간이 줄지 않음
     traded = {t[2] for t in r["trades"]}
     assert {"A", "B"} <= traded and "P" in r["skipped"]
+
+
+def test_parse_targets_from_file(tmp_path):
+    from kis_api import parse_targets
+    f = tmp_path / "u.txt"
+    f.write_text("# 제목\nNVDA:NAS   # 설명\n\nCRM:NYS, amd\n", encoding="utf-8")
+    assert parse_targets(f"@{f}") == {"NVDA": "NAS", "CRM": "NYS", "AMD": "NAS"}
+    assert len(parse_targets("@universes/growth_balanced.txt")) == 39
+
+
+def test_common_start_and_hold_curve_with_late_listing():
+    from strategies import common_start, hold_curve
+    full = {k: _dip_series(30, 5) for k in "ABC"}
+    full["L"] = _dip_series(30, 5)[25:]               # 시작일 뒤 상장
+    start = common_start(full, trend_ma=20)
+    assert start == "d19"                              # 4개 중 3개(75%) 준비된 날
+    dates = [b["date"] for b in full["A"] if b["date"] >= start]
+    curve, n = hold_curve(full, dates, 1000, fee_pct=0, slip_pct=0)
+    assert n == 3 and curve[0] == pytest.approx(1000)  # 시작일에 시세 있는 3개만 균등 매수

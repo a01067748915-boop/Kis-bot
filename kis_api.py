@@ -40,9 +40,17 @@ class KISError(Exception):
 
 
 def parse_targets(text):
-    """'QQQM:NAS,SOXX:NAS' → {'QQQM': 'NAS', 'SOXX': 'NAS'}"""
+    """'QQQM:NAS,SOXX:NAS' → {'QQQM': 'NAS', 'SOXX': 'NAS'}
+    '@파일경로' 면 파일에서 읽음 (봇 폴더 기준 상대경로, 쉼표·줄바꿈 구분, # 뒤는 주석)"""
+    text = text.strip()
+    if text.startswith("@"):
+        path = Path(text[1:])
+        if not path.is_absolute():
+            path = Path(__file__).resolve().parent / path
+        lines = path.read_text(encoding="utf-8").splitlines()
+        text = ",".join(line.split("#", 1)[0] for line in lines)
     out = {}
-    for item in text.split(","):
+    for item in text.replace("\n", ",").split(","):
         item = item.strip().upper()
         if not item:
             continue

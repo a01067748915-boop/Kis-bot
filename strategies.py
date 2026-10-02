@@ -271,9 +271,31 @@ def portfolio(datasets, budget=950.0, slots=2, rsi_max=10, trend_ma=200, max_day
 
 
 PORTFOLIO_VARIANTS = [  # (이름, slots, rsi_max)
-    ("RSI<10 1칸", 1, 10), ("RSI<10 2칸", 2, 10), ("RSI<10 3칸", 3, 10),
-    ("RSI<5  2칸", 2, 5), ("RSI<20 3칸", 3, 20),
+    ("RSI<10 1칸", 1, 10), ("RSI<10 2칸", 2, 10), ("RSI<10 3칸", 3, 10), ("RSI<10 4칸", 4, 10),
+    ("RSI<5  2칸", 2, 5), ("RSI<5  4칸", 4, 5), ("RSI<20 3칸", 3, 20),
 ]
+
+
+def common_start(datasets, trend_ma=200, share=0.75):
+    """종목의 share 비율 이상이 지표 준비된 첫날 — 늦게 상장한 소수 종목 때문에 기간이 줄지 않게"""
+    ready = sorted(min(indicators(b, trend_ma) or {"99999999": 0}) for b in datasets.values())
+    k = max(1, int(len(ready) * share + 0.999)) - 1
+    return ready[k] if ready[k] != "99999999" else None
+
+
+def hold_curve(datasets, dates, budget, fee_pct=0.25, slip_pct=0.05):
+    """시작일에 시세가 있는 종목을 균등하게 사서 보유(빈 날은 직전 종가) → (곡선, 포함 종목 수)"""
+    fee, slip = fee_pct / 100, slip_pct / 100
+    pxs = {s: by_date(b) for s, b in datasets.items()}
+    names = [s for s, p in pxs.items() if dates[0] in p]
+    shares = {s: budget / len(names) * (1 - fee) / (pxs[s][dates[0]]["open"] * (1 + slip)) for s in names}
+    last, curve = {}, []
+    for d in dates:
+        for s in names:
+            if d in pxs[s]:
+                last[s] = pxs[s][d]["close"]
+        curve.append(sum(shares[s] * last[s] for s in names if s in last))
+    return curve, len(names)
 
 
 def yearly(dates, curve, start_value):
@@ -314,8 +336,9 @@ def run_market_filters(datasets, opts, budget, market_name, market_bars, slots=2
         return
     if not any(b.get("volume") for b in market_bars):
         print("  ⚠️ 거래량 데이터 없음 → ②투매 결과는 의미 없음")
+    start = common_start(datasets)
     for name, f in MARKET_FILTERS:
-        r = portfolio(datasets, budget, slots=slots, market=m, mfilter=f, **opts)
+        r = portfolio(datasets, budget, slots=slots, market=m, mfilter=f, start=start, **opts)
         print_portfolio_row(name, r, budget)
         if f:
             print(f"     매수 허용일 {r['open_days'] * 100:.0f}%")
@@ -362,18 +385,24 @@ def run_portfolio(datasets, opts, budget):
     if len(datasets) < 2:
         print("  종목이 2개 이상 필요합니다")
         return
-    base = portfolio(datasets, budget, **opts)
+    start = common_start(datasets)
+    base = portfolio(datasets, budget, start=start, **opts)
     dates = base["dates"]
     if len(dates) < 60:
         print(f"  공통 데이터 부족 ({len(dates)}일) — --years 를 늘리세요")
         return
-    hold = [simulate(dates, {s: by_date(b)}, [s] * len(dates), **opts)[0] for s, b in datasets.items()]
-    eq_hold = [sum(c[i] for c in hold) / len(hold) * budget for i in range(len(dates))]
+    eq_hold, n_hold = hold_curve(datasets, dates, budget, **opts)
+    late = [s for s, b in datasets.items() if not b or b[0]["date"] > dates[0] or dates[0] not in by_date(b)]
     print(f"  기간 {dates[0]}~{dates[-1]} ({len(dates)}일)")
-    print(f"  균등 보유     : {fmt(summary([v / budget for v in eq_hold]))}")
+    if late:
+        print(f"  ※ 늦게 상장·데이터 시작이라 중간부터 참여(균등 보유 비교에선 제외): {', '.join(late)}")
+    print(f"  균등 보유({n_hold}) : {fmt(summary([v / budget for v in eq_hold]))}")
     print(f"     연도별   : {yearly(dates, eq_hold, budget)}")
     for name, slots, rmax in PORTFOLIO_VARIANTS:
-        print_portfolio_row(name, portfolio(datasets, budget, slots=slots, rsi_max=rmax, **opts), budget)
+        r = portfolio(datasets, budget, slots=slots, rsi_max=rmax, start=start, **opts)
+        print_portfolio_row(name, r, budget)
+        if r["skipped"]:
+            print(f"     칸 예산보다 비싸 한 번도 못 산 종목: {', '.join(sorted(r['skipped']))}")
 
 
 # ─── ③ 모멘텀 순환 ───────────────────────────────────
