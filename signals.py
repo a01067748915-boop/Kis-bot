@@ -50,3 +50,20 @@ def market_indicators(bars, trend_ma=200, vol_ma=20, vol_mult=1.5, window=3):
                           "rsi": r[i], "vol_ratio": ratio, "panic": panic,
                           "panic_recent": any(panics[max(0, i + 1 - window):i + 1])}
     return out
+
+
+def breakout_indicators(bars, entry_n=55, exit_n=20, trend_ma=200, mom_n=126):
+    """스윙 돌파 날짜별 {entry, exit, trend, mom} — 그날 종가까지로 계산
+    entry: 종가가 직전 entry_n일 최고 종가 돌파 / exit: 직전 exit_n일 최저 종가 아래로
+    trend: 종가 > trend_ma일선 (0이면 항상 True) / mom: 최근 mom_n일 수익률(우선순위용)"""
+    closes = [b["close"] for b in bars]
+    need = max(entry_n, exit_n, trend_ma, mom_n)
+    out = {}
+    for i, b in enumerate(bars):
+        if i < need:
+            continue
+        c = closes[i]
+        out[b["date"]] = {"entry": c > max(closes[i - entry_n:i]), "exit": c < min(closes[i - exit_n:i]),
+                          "trend": not trend_ma or c > sum(closes[i + 1 - trend_ma:i + 1]) / trend_ma,
+                          "mom": c / closes[i - mom_n] - 1}
+    return out

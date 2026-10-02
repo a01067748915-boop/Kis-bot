@@ -6,6 +6,7 @@
   python strategies.py --only trend --years 8
   python strategies.py --only pullback --targets SOXX:NAS,QQQM:NAS,AMD:NAS,PLTR:NAS
   python strategies.py --only portfolio --targets SOXX:NAS,SMH:NAS,AMD:NAS,PLTR:NAS,HOOD:NAS
+  python strategies.py --only breakout --targets @universes/growth_balanced.txt --years 10
 
 A. 눌림목 매수 (종목별, 며칠 보유)
    200일선 위(상승 추세)인데 RSI(2)가 기준 아래로 급락하면 다음 날 시가에 매수
@@ -28,7 +29,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from backtest import fetch_bars, load_csv
-from signals import indicators, market_indicators, rsi
+from signals import breakout_indicators, indicators, market_indicators, rsi
 
 HERE = Path(__file__).resolve().parent
 
@@ -213,18 +214,12 @@ def run_pullback(datasets, opts):
 
 
 # ─── A'. 눌림목 매수 — 예산을 모아 쓰는 포트폴리오 ─────
-def portfolio(datasets, budget=950.0, slots=2, rsi_max=10, trend_ma=200, max_days=10,
-              fee_pct=0.25, slip_pct=0.05, whole_shares=True, market=None, mfilter=None, mrsi_max=10,
-              start=None):
-    """예산 하나를 slots 칸으로 나눠, 신호 난 종목 중 RSI가 가장 낮은 것부터 채움
-    market: market_indicators() 결과(날짜별), mfilter: 시장 필터
-      "trend" 시장이 200일선 위일 때만 매수 / "panic" 최근 3일 안에 투매(하락+거래량 급증)가 있을 때만
-      "mrsi"  시장 RSI(2) < mrsi_max 일 때만, 종목 RSI 기준 없이 200일선 위 종목 중 RSI 낮은 순
-    start: 시작일(YYYYMMDD). 없으면 모든 종목 지표가 준비된 첫날. 시작 뒤 상장·지표 준비된 종목은 그때부터 참여
-    → {"dates", "curve"(달러), "trades"[(수익률, 보유일, 종목)], "used"(평균 사용 칸 비율),
-       "open_days"(매수 허용일 비율), "skipped"(신호는 났지만 1주 가격이 칸보다 비싸 못 산 종목)}"""
+def slot_engine(datasets, ind, budget, slots, wants_exit, candidates, fee_pct=0.25, slip_pct=0.05,
+                whole_shares=True, start=None, date_ok=None):
+    """예산 하나를 slots 칸으로 나눠 운용하는 공통 엔진 (매매는 모두 그날 시가, 신호는 전날 종가 기준)
+    ind[s][날짜]: 종목별 지표 / wants_exit(s, y, pos) → 매도 사유 여부 / candidates(y, d, ready, held) → 매수 우선순위 목록
+    date_ok(y) → 그날 진행 여부(시장 데이터 등) / 1주 단위 매수, 칸 예산으로 1주도 못 사면 다음 후보"""
     fee, slip = fee_pct / 100, slip_pct / 100
-    ind = {s: indicators(b, trend_ma) for s, b in datasets.items()}
     px = {s: by_date(b) for s, b in datasets.items()}
     cal = sorted(set().union(*(set(v) for v in px.values())))
     prev_of = dict(zip(cal[1:], cal))
@@ -234,31 +229,22 @@ def portfolio(datasets, budget=950.0, slots=2, rsi_max=10, trend_ma=200, max_day
 
     if start is None:
         start = next((d for d in cal[1:] if all(ready(s, d) for s in px)), None)
-    dates = [d for d in cal[1:] if start and d >= start and (market is None or prev_of[d] in market)]
-    cash, pos, curve, trades, used, open_days, last, skipped = budget, {}, [], [], 0, 0, {}, set()
+    dates = [d for d in cal[1:] if start and d >= start and (date_ok is None or date_ok(prev_of[d]))]
+    cash, pos, curve, trades, used, last, skipped = budget, {}, [], [], 0, {}, set()
     for d in dates:
         y = prev_of[d]
-        # 1) 매도: 전날 종가가 단기선 위로 회복했거나 최대 보유일 도달 → 오늘 시가 (거래정지 등 시세 없는 날은 보류)
+        # 1) 매도 (거래정지 등 시세 없는 날은 보류)
         for s in list(pos):
             p = pos[s]
             p["days"] += 1
-            if not ready(s, d):
-                continue
-            if ind[s][y]["recovered"] or p["days"] >= max_days:
+            if ready(s, d) and wants_exit(s, y, p):
                 got = p["qty"] * px[s][d]["open"] * (1 - slip) * (1 - fee)
                 cash += got
                 trades.append((got / p["cost"] - 1, p["days"], s))
                 del pos[s]
-        # 2) 매수: 빈 칸만큼, 전날 RSI 낮은 순 (시장 필터가 막으면 쉼)
-        m = market[y] if market is not None else None
-        allow = (mfilter is None or (mfilter == "trend" and m["trend"])
-                 or (mfilter == "panic" and m["panic_recent"]) or (mfilter == "mrsi" and m["rsi"] < mrsi_max))
-        open_days += allow
-        limit = 101 if mfilter == "mrsi" else rsi_max
+        # 2) 매수: 빈 칸만큼 우선순위대로
         equity_open = cash + sum(p["qty"] * (px[s][d]["open"] if d in px[s] else last[s]) for s, p in pos.items())
-        cands = [] if not allow else sorted((ind[s][y]["rsi"], s) for s in ind if s not in pos and ready(s, d)
-                                            and ind[s][y]["trend"] and ind[s][y]["rsi"] < limit)
-        for _, s in cands:
+        for s in candidates(y, d, ready, pos):
             if len(pos) >= slots:
                 break
             price = px[s][d]["open"] * (1 + slip)
@@ -266,7 +252,7 @@ def portfolio(datasets, budget=950.0, slots=2, rsi_max=10, trend_ma=200, max_day
             qty = int(alloc * (1 - fee) / price) if whole_shares else alloc * (1 - fee) / price
             if qty <= 0:
                 skipped.add(s)
-                continue  # 1주도 못 사면 다음 후보
+                continue
             cost = qty * price / (1 - fee)
             cash -= cost
             pos[s] = {"qty": qty, "cost": cost, "days": 0}
@@ -276,8 +262,57 @@ def portfolio(datasets, budget=950.0, slots=2, rsi_max=10, trend_ma=200, max_day
                 last[s] = px[s][d]["close"]
         curve.append(cash + sum(p["qty"] * last[s] for s, p in pos.items()))
     n = max(1, len(dates))
-    return {"dates": dates, "curve": curve, "trades": trades, "used": used / n / slots, "open_days": open_days / n,
+    return {"dates": dates, "curve": curve, "trades": trades, "used": used / n / slots,
             "skipped": skipped - {t[2] for t in trades}}
+
+
+def portfolio(datasets, budget=950.0, slots=2, rsi_max=10, trend_ma=200, max_days=10,
+              fee_pct=0.25, slip_pct=0.05, whole_shares=True, market=None, mfilter=None, mrsi_max=10,
+              start=None):
+    """눌림목 매수 포트폴리오: 신호 난 종목 중 RSI가 가장 낮은 것부터 칸을 채움
+    market: market_indicators() 결과(날짜별), mfilter: 시장 필터
+      "trend" 시장이 200일선 위일 때만 매수 / "panic" 최근 3일 안에 투매(하락+거래량 급증)가 있을 때만
+      "mrsi"  시장 RSI(2) < mrsi_max 일 때만, 종목 RSI 기준 없이 200일선 위 종목 중 RSI 낮은 순
+    start: 시작일(YYYYMMDD). 없으면 모든 종목 지표가 준비된 첫날. 시작 뒤 상장·지표 준비된 종목은 그때부터 참여
+    → {"dates", "curve"(달러), "trades"[(수익률, 보유일, 종목)], "used"(평균 사용 칸 비율),
+       "open_days"(매수 허용일 비율), "skipped"(신호는 났지만 1주 가격이 칸보다 비싸 못 산 종목)}"""
+    ind = {s: indicators(b, trend_ma) for s, b in datasets.items()}
+    limit = 101 if mfilter == "mrsi" else rsi_max
+    allowed = []
+
+    def wants_exit(s, y, p):  # 전날 종가가 단기선 위로 회복했거나 최대 보유일 도달
+        return ind[s][y]["recovered"] or p["days"] >= max_days
+
+    def candidates(y, d, ready, held):  # 전날 RSI 낮은 순 (시장 필터가 막으면 쉼)
+        m = market[y] if market is not None else None
+        allow = (mfilter is None or (mfilter == "trend" and m["trend"])
+                 or (mfilter == "panic" and m["panic_recent"]) or (mfilter == "mrsi" and m["rsi"] < mrsi_max))
+        allowed.append(allow)
+        if not allow:
+            return []
+        return [s for _, s in sorted((ind[s][y]["rsi"], s) for s in ind if s not in held and ready(s, d)
+                                     and ind[s][y]["trend"] and ind[s][y]["rsi"] < limit)]
+
+    r = slot_engine(datasets, ind, budget, slots, wants_exit, candidates, fee_pct, slip_pct, whole_shares, start,
+                    None if market is None else (lambda y: y in market))
+    r["open_days"] = sum(allowed) / max(1, len(allowed))
+    return r
+
+
+def breakout_portfolio(datasets, budget=950.0, slots=2, entry_n=55, exit_n=20, trend_ma=200, mom_n=126,
+                       fee_pct=0.25, slip_pct=0.05, whole_shares=True, start=None):
+    """B. 스윙 돌파(터틀 방식): 전날 종가가 직전 entry_n일 최고 종가를 넘으면 매수,
+    직전 exit_n일 최저 종가 아래로 내려가면 매도. 같은 날 여러 신호면 최근 mom_n일 수익률 높은 순"""
+    ind = {s: breakout_indicators(b, entry_n, exit_n, trend_ma, mom_n) for s, b in datasets.items()}
+
+    def wants_exit(s, y, p):
+        return ind[s][y]["exit"]
+
+    def candidates(y, d, ready, held):
+        return [s for _, s in sorted((-ind[s][y]["mom"], s) for s in ind if s not in held and ready(s, d)
+                                     and ind[s][y]["entry"] and ind[s][y]["trend"])]
+
+    return slot_engine(datasets, ind, budget, slots, wants_exit, candidates, fee_pct, slip_pct, whole_shares, start)
 
 
 PORTFOLIO_VARIANTS = [  # (이름, slots, rsi_max)
@@ -325,8 +360,9 @@ def print_portfolio_row(name, r, budget):
     n = len(t)
     avg = sum(x[0] for x in t) / n * 100 if n else 0
     win = sum(x[0] > 0 for x in t) / n * 100 if n else 0
+    days = sum(x[1] for x in t) / n if n else 0
     print(f"  {name:<11}: {fmt(summary([v / budget for v in r['curve']]))}, 매매 {n}회,"
-          f" 승률 {win:.0f}%, 1회평균 {avg:+.2f}%, 투자비율 {r['used'] * 100:.0f}%")
+          f" 승률 {win:.0f}%, 1회평균 {avg:+.2f}%, 평균보유 {days:.0f}일, 투자비율 {r['used'] * 100:.0f}%")
     print(f"     연도별   : {yearly(r['dates'], r['curve'], budget)}  → 최종 {usd(r['curve'][-1])}")
 
 
@@ -387,6 +423,37 @@ def run_universe(base, extra, opts, budget):
         ranked = sorted(by_sym.items(), key=lambda x: -x[1][1])
         print("  종목별 기여 (3칸 RSI<10, 누적 수익률 합): "
               + ", ".join(f"{k} {t * 100:+.0f}%({n})" for k, (n, t) in ranked))
+
+
+BREAKOUT_VARIANTS = [  # (이름, slots, entry_n, exit_n, trend_ma)
+    ("돌파20/10 2칸", 2, 20, 10, 200), ("돌파20/10 4칸", 4, 20, 10, 200),
+    ("돌파55/20 2칸", 2, 55, 20, 200), ("돌파55/20 4칸", 4, 55, 20, 200),
+    ("돌파55/20 4칸 추세무시", 4, 55, 20, 0),
+]
+
+
+def run_breakout(datasets, opts, budget):
+    print(f"\n━━ B. 스윙 돌파 — 예산 {usd(budget)}, N일 최고가 돌파 매수 · M일 최저가 이탈 매도 ━━")
+    print("  같은 날 여러 신호면 최근 6개월 수익률 높은 순 / 200일선 위만 (추세무시 제외) / 1주 단위 매수")
+    if len(datasets) < 2:
+        print("  종목이 2개 이상 필요합니다")
+        return
+    start = common_start(datasets)
+    ref = portfolio(datasets, budget, slots=4, rsi_max=5, start=start, **opts)
+    dates = ref["dates"]
+    if len(dates) < 60:
+        print(f"  공통 데이터 부족 ({len(dates)}일) — --years 를 늘리세요")
+        return
+    eq_hold, n_hold = hold_curve(datasets, dates, budget, **opts)
+    print(f"  기간 {dates[0]}~{dates[-1]} ({len(dates)}일)")
+    print(f"  균등 보유({n_hold}) : {fmt(summary([v / budget for v in eq_hold]))}")
+    print(f"     연도별   : {yearly(dates, eq_hold, budget)}")
+    print_portfolio_row("(비교) 눌림목 RSI<5 4칸", ref, budget)
+    for name, slots, en, ex, tma in BREAKOUT_VARIANTS:
+        r = breakout_portfolio(datasets, budget, slots=slots, entry_n=en, exit_n=ex, trend_ma=tma, start=start, **opts)
+        print_portfolio_row(name, r, budget)
+        if r["skipped"]:
+            print(f"     칸 예산보다 비싸 한 번도 못 산 종목: {', '.join(sorted(r['skipped']))}")
 
 
 def run_portfolio(datasets, opts, budget):
@@ -471,7 +538,8 @@ def main():
     p.add_argument("--add", help="portfolio 종목 수 비교: 기존 --targets 에 더할 종목, 예: NVDA:NAS,TSLA:NAS")
     p.add_argument("--market", default="SPY:AMS",
                    help="portfolio 시장 필터 기준 종목 (기본 SPY:AMS, none=비교 생략)")
-    p.add_argument("--only", choices=["pullback", "portfolio", "trend", "rotation"], help="한 전략만 실행")
+    p.add_argument("--only", choices=["pullback", "portfolio", "breakout", "trend", "rotation"],
+                   help="한 전략만 실행")
     p.add_argument("--fee", type=float, default=None, help="편도 수수료(%%) 덮어쓰기")
     p.add_argument("--csv", nargs="+", help="date,open,high,low,close CSV 파일들로 테스트 (파일명=종목명)")
     a = p.parse_args()
@@ -534,6 +602,8 @@ def main():
             run_market_filters(stocks, opts, float(g("BUDGET_USD", "950")), market_name, market_bars)
         elif use_market:
             print(f"\n⚠️ {market_name} 시세를 못 받아 시장 필터 비교 생략")
+    if a.only in (None, "breakout"):
+        run_breakout(stocks, opts, float(g("BUDGET_USD", "950")))
     if a.only in (None, "trend"):
         run_trend(stocks, opts)
     if a.only in (None, "rotation"):

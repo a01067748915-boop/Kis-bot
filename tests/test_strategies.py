@@ -170,3 +170,20 @@ def test_common_start_and_hold_curve_with_late_listing():
     dates = [b["date"] for b in full["A"] if b["date"] >= start]
     curve, n = hold_curve(full, dates, 1000, fee_pct=0, slip_pct=0)
     assert n == 3 and curve[0] == pytest.approx(1000)  # 시작일에 시세 있는 3개만 균등 매수
+
+
+def test_breakout_indicators_and_portfolio():
+    from signals import breakout_indicators
+    from strategies import breakout_portfolio
+    closes = [100] * 30 + [101 + i for i in range(10)] + [110 - 3 * i for i in range(10)]
+    bars = [bar(f"d{i:02d}", c, c) for i, c in enumerate(closes)]
+    ind = breakout_indicators(bars, entry_n=5, exit_n=3, trend_ma=0, mom_n=5)
+    assert ind["d30"]["entry"] and not ind["d29"]["entry"]   # 횡보 후 첫 신고가
+    assert ind["d41"]["exit"] and not ind["d39"]["exit"]     # 하락 전환 후 3일 최저 이탈
+    flat = [bar(f"d{i:02d}", 50, 50) for i in range(len(closes))]
+    r = breakout_portfolio({"UP": bars, "FLAT": flat}, budget=1000, slots=1, entry_n=5, exit_n=3,
+                           trend_ma=0, mom_n=5, fee_pct=0, slip_pct=0)
+    assert [t[2] for t in r["trades"]] == ["UP"]
+    ret, days, _ = r["trades"][0]
+    assert ret == pytest.approx(closes[42] / closes[31] - 1)  # d31 시가 매수 → d42 시가 매도
+    assert days == 11
