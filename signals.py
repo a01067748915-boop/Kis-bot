@@ -29,3 +29,24 @@ def indicators(bars, trend_ma=200, exit_ma=5):
         out[b["date"]] = {"rsi": r[i], "trend": trend,
                           "recovered": closes[i] > sum(closes[i + 1 - exit_ma:i + 1]) / exit_ma}
     return out
+
+
+def market_indicators(bars, trend_ma=200, vol_ma=20, vol_mult=1.5, window=3):
+    """시장 대용 종목(SPY 등) 날짜별 {trend, rsi, vol_ratio, panic, panic_recent} — 그날 종가까지로 계산
+    panic: 하락 마감 + 거래량이 직전 vol_ma일 평균의 vol_mult배 이상 (투매)
+    panic_recent: 최근 window 거래일(그날 포함) 안에 panic 이 있었음"""
+    closes = [b["close"] for b in bars]
+    vols = [b.get("volume") or 0 for b in bars]
+    r = rsi(closes, 2)
+    out, panics = {}, []
+    for i, b in enumerate(bars):
+        avg_vol = sum(vols[i - vol_ma:i]) / vol_ma if i >= vol_ma else 0
+        ratio = vols[i] / avg_vol if avg_vol else 0
+        panic = i > 0 and closes[i] < closes[i - 1] and ratio >= vol_mult
+        panics.append(panic)
+        if i + 1 < max(trend_ma, vol_ma + 1) or r[i] is None:
+            continue
+        out[b["date"]] = {"trend": closes[i] > sum(closes[i + 1 - trend_ma:i + 1]) / trend_ma,
+                          "rsi": r[i], "vol_ratio": ratio, "panic": panic,
+                          "panic_recent": any(panics[max(0, i + 1 - window):i + 1])}
+    return out

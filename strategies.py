@@ -28,7 +28,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from backtest import fetch_bars, load_csv
-from signals import indicators, rsi
+from signals import indicators, market_indicators, rsi
 
 HERE = Path(__file__).resolve().parent
 
@@ -204,16 +204,20 @@ def run_pullback(datasets, opts):
 
 # ─── A'. 눌림목 매수 — 예산을 모아 쓰는 포트폴리오 ─────
 def portfolio(datasets, budget=950.0, slots=2, rsi_max=10, trend_ma=200, max_days=10,
-              fee_pct=0.25, slip_pct=0.05, whole_shares=True):
+              fee_pct=0.25, slip_pct=0.05, whole_shares=True, market=None, mfilter=None, mrsi_max=10):
     """예산 하나를 slots 칸으로 나눠, 신호 난 종목 중 RSI가 가장 낮은 것부터 채움
-    → {"dates", "curve"(달러), "trades"[(수익률, 보유일)], "used"(평균 사용 칸 비율)}"""
+    market: market_indicators() 결과(날짜별), mfilter: 시장 필터
+      "trend" 시장이 200일선 위일 때만 매수 / "panic" 최근 3일 안에 투매(하락+거래량 급증)가 있을 때만
+      "mrsi"  시장 RSI(2) < mrsi_max 일 때만, 종목 RSI 기준 없이 200일선 위 종목 중 RSI 낮은 순
+    → {"dates", "curve"(달러), "trades"[(수익률, 보유일)], "used"(평균 사용 칸 비율), "open_days"(매수 허용일 비율)}"""
     fee, slip = fee_pct / 100, slip_pct / 100
     ind = {s: indicators(b, trend_ma) for s, b in datasets.items()}
     px = {s: by_date(b) for s, b in datasets.items()}
     common = sorted(set.intersection(*(set(v) for v in px.values())))
     prev_of = dict(zip(common[1:], common))
-    dates = [d for d in common[1:] if all(prev_of[d] in ind[s] for s in ind)]  # 지표가 다 준비된 날부터
-    cash, pos, curve, trades, used = budget, {}, [], [], 0
+    dates = [d for d in common[1:] if all(prev_of[d] in ind[s] for s in ind)  # 지표가 다 준비된 날부터
+             and (market is None or prev_of[d] in market)]
+    cash, pos, curve, trades, used, open_days = budget, {}, [], [], 0, 0
     for d in dates:
         y = prev_of[d]
         # 1) 매도: 전날 종가가 단기선 위로 회복했거나 최대 보유일 도달 → 오늘 시가
@@ -225,10 +229,15 @@ def portfolio(datasets, budget=950.0, slots=2, rsi_max=10, trend_ma=200, max_day
                 cash += got
                 trades.append((got / p["cost"] - 1, p["days"]))
                 del pos[s]
-        # 2) 매수: 빈 칸만큼, 전날 RSI 낮은 순
+        # 2) 매수: 빈 칸만큼, 전날 RSI 낮은 순 (시장 필터가 막으면 쉼)
+        m = market[y] if market is not None else None
+        allow = (mfilter is None or (mfilter == "trend" and m["trend"])
+                 or (mfilter == "panic" and m["panic_recent"]) or (mfilter == "mrsi" and m["rsi"] < mrsi_max))
+        open_days += allow
+        limit = 101 if mfilter == "mrsi" else rsi_max
         equity_open = cash + sum(p["qty"] * px[s][d]["open"] for s, p in pos.items())
-        cands = sorted((ind[s][y]["rsi"], s) for s in ind
-                       if s not in pos and ind[s][y]["trend"] and ind[s][y]["rsi"] < rsi_max)
+        cands = [] if not allow else sorted((ind[s][y]["rsi"], s) for s in ind
+                                            if s not in pos and ind[s][y]["trend"] and ind[s][y]["rsi"] < limit)
         for _, s in cands:
             if len(pos) >= slots:
                 break
@@ -242,7 +251,8 @@ def portfolio(datasets, budget=950.0, slots=2, rsi_max=10, trend_ma=200, max_day
             pos[s] = {"qty": qty, "cost": cost, "days": 0}
         used += len(pos)
         curve.append(cash + sum(p["qty"] * px[s][d]["close"] for s, p in pos.items()))
-    return {"dates": dates, "curve": curve, "trades": trades, "used": used / max(1, len(dates)) / slots}
+    n = max(1, len(dates))
+    return {"dates": dates, "curve": curve, "trades": trades, "used": used / n / slots, "open_days": open_days / n}
 
 
 PORTFOLIO_VARIANTS = [  # (이름, slots, rsi_max)
@@ -263,6 +273,39 @@ def yearly(dates, curve, start_value):
     return " ".join(f"{yr} {r * 100:+.0f}%" for yr, r in out)
 
 
+def print_portfolio_row(name, r, budget):
+    t = r["trades"]
+    n = len(t)
+    avg = sum(x for x, _ in t) / n * 100 if n else 0
+    win = sum(x > 0 for x, _ in t) / n * 100 if n else 0
+    print(f"  {name:<11}: {fmt(summary([v / budget for v in r['curve']]))}, 매매 {n}회,"
+          f" 승률 {win:.0f}%, 1회평균 {avg:+.2f}%, 투자비율 {r['used'] * 100:.0f}%")
+    print(f"     연도별   : {yearly(r['dates'], r['curve'], budget)}  → 최종 {usd(r['curve'][-1])}")
+
+
+MARKET_FILTERS = [  # (이름, mfilter)
+    ("필터 없음", None), ("①시장추세", "trend"), ("②투매", "panic"), ("③시장과매도", "mrsi"),
+]
+
+
+def run_market_filters(datasets, opts, budget, market_name, market_bars, slots=2):
+    print(f"\n━━ 시장 필터 비교 ({market_name} 기준, RSI<10 {slots}칸) ━━")
+    print(f"  ①시장추세   : {market_name} 가 200일선 위일 때만 매수")
+    print(f"  ②투매       : 최근 3거래일 안에 {market_name} 하락 + 거래량 20일 평균의 1.5배↑ 인 날이 있을 때만")
+    print(f"  ③시장과매도 : {market_name} RSI(2)<10 일 때만, 종목 RSI 기준 없이 200일선 위 종목 중 많이 빠진 순")
+    m = market_indicators(market_bars)
+    if not m:
+        print(f"  {market_name} 데이터 부족 — --years 를 늘리세요")
+        return
+    if not any(b.get("volume") for b in market_bars):
+        print("  ⚠️ 거래량 데이터 없음 → ②투매 결과는 의미 없음")
+    for name, f in MARKET_FILTERS:
+        r = portfolio(datasets, budget, slots=slots, market=m, mfilter=f, **opts)
+        print_portfolio_row(name, r, budget)
+        if f:
+            print(f"     매수 허용일 {r['open_days'] * 100:.0f}%")
+
+
 def run_portfolio(datasets, opts, budget):
     print(f"\n━━ A'. 눌림목 매수 — 예산 {usd(budget)} 하나로 모든 종목 감시, 신호 난 종목에 칸 단위로 투입 ━━")
     print(f"  종목 {', '.join(datasets)} / 같은 날 여러 신호면 RSI 낮은 순 / 1주 단위 매수")
@@ -280,14 +323,7 @@ def run_portfolio(datasets, opts, budget):
     print(f"  균등 보유     : {fmt(summary([v / budget for v in eq_hold]))}")
     print(f"     연도별   : {yearly(dates, eq_hold, budget)}")
     for name, slots, rmax in PORTFOLIO_VARIANTS:
-        r = portfolio(datasets, budget, slots=slots, rsi_max=rmax, **opts)
-        t = r["trades"]
-        n = len(t)
-        avg = sum(x for x, _ in t) / n * 100 if n else 0
-        win = sum(x > 0 for x, _ in t) / n * 100 if n else 0
-        print(f"  {name:<11}: {fmt(summary([v / budget for v in r['curve']]))}, 매매 {n}회,"
-              f" 승률 {win:.0f}%, 1회평균 {avg:+.2f}%, 투자비율 {r['used'] * 100:.0f}%")
-        print(f"     연도별   : {yearly(r['dates'], r['curve'], budget)}  → 최종 {usd(r['curve'][-1])}")
+        print_portfolio_row(name, portfolio(datasets, budget, slots=slots, rsi_max=rmax, **opts), budget)
 
 
 # ─── ③ 모멘텀 순환 ───────────────────────────────────
@@ -343,6 +379,8 @@ def main():
     p.add_argument("--years", type=int, default=5)
     p.add_argument("--targets", help="종목, 예: QQQM:NAS,SOXX:NAS,SCHD:AMS (기본: .env 의 TARGETS)")
     p.add_argument("--safe", help="③ 대피처 종목, 예: SGOV:AMS (없으면 현금)")
+    p.add_argument("--market", default="SPY:AMS",
+                   help="portfolio 시장 필터 기준 종목 (기본 SPY:AMS, none=비교 생략)")
     p.add_argument("--only", choices=["pullback", "portfolio", "trend", "rotation"], help="한 전략만 실행")
     p.add_argument("--fee", type=float, default=None, help="편도 수수료(%%) 덮어쓰기")
     p.add_argument("--csv", nargs="+", help="date,open,high,low,close CSV 파일들로 테스트 (파일명=종목명)")
@@ -351,9 +389,14 @@ def main():
     load_dotenv(HERE / ".env")
     g = os.environ.get
     opts = {"fee_pct": a.fee if a.fee is not None else float(g("FEE_PCT", "0.25")), "slip_pct": 0.05}
-    safe = None
+    safe, market_name, market_bars = None, None, None
+    use_market = a.only in (None, "portfolio") and a.market.lower() != "none"
+    if use_market:
+        market_name = a.market.split(":")[0].upper()
     if a.csv:
         datasets = {Path(f).stem: load_csv(f) for f in a.csv}
+        if use_market and market_name in datasets:  # CSV 모드: 시장 종목 파일을 따로 뺌
+            market_bars = datasets.pop(market_name)
     else:
         from kis_api import KIS, parse_targets
         api = KIS(g("KIS_ENV", "mock"), g("KIS_APP_KEY"), g("KIS_APP_SECRET"), g("KIS_ACCOUNT"), HERE)
@@ -369,6 +412,10 @@ def main():
             if not datasets[sym]:
                 print(f"  ⚠️ {sym}({ex}) 시세 없음 — 거래소 코드를 확인하세요")
                 datasets.pop(sym)
+        if use_market:
+            print(f"{market_name} 일봉 수집 중… (시장 필터용)")
+            sym, ex = next(iter(parse_targets(a.market).items()))
+            market_bars = fetch_bars(api, sym, ex, a.years) or None
 
     print(f"\n수수료 편도 {opts['fee_pct']}%, 슬리피지 {opts['slip_pct']}%")
     stocks = {s: b for s, b in datasets.items() if s != safe}
@@ -376,6 +423,10 @@ def main():
         run_pullback(stocks, opts)
     if a.only in (None, "portfolio"):
         run_portfolio(stocks, opts, float(g("BUDGET_USD", "950")))
+        if market_bars:
+            run_market_filters(stocks, opts, float(g("BUDGET_USD", "950")), market_name, market_bars)
+        elif use_market:
+            print(f"\n⚠️ {market_name} 시세를 못 받아 시장 필터 비교 생략")
     if a.only in (None, "trend"):
         run_trend(stocks, opts)
     if a.only in (None, "rotation"):

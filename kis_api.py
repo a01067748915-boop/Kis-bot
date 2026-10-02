@@ -171,7 +171,8 @@ class KIS:
             try:
                 if b.get("xymd"):
                     bars.append({"date": b["xymd"], "open": float(b["open"]), "high": float(b["high"]),
-                                 "low": float(b["low"]), "close": float(b["clos"])})
+                                 "low": float(b["low"]), "close": float(b["clos"]),
+                                 "volume": float(b.get("tvol") or 0)})
             except (TypeError, ValueError):
                 continue
         return sorted(bars, key=lambda x: x["date"])

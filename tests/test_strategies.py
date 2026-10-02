@@ -101,3 +101,39 @@ def test_yearly_returns():
     from strategies import yearly
     assert yearly(["20230101", "20231231", "20240101", "20241231"], [110, 121, 121, 133.1], 100) \
         == "2023 +21% 2024 +10%"
+
+
+def mbar(d, c, v):
+    return {"date": d, "open": c, "high": c, "low": c, "close": c, "volume": v}
+
+
+def test_market_indicators_panic_and_trend():
+    from signals import market_indicators
+    bars = [mbar(f"d{i:02d}", 100 + i, 1000) for i in range(30)]
+    bars.append(mbar("d30", 120, 2000))   # 하락 + 거래량 2배 → 투매
+    bars.append(mbar("d31", 121, 1000))
+    bars.append(mbar("d32", 122, 1000))
+    bars.append(mbar("d33", 123, 1000))
+    bars.append(mbar("d34", 115, 1200))   # 하락했지만 거래량 1.2배 → 투매 아님
+    m = market_indicators(bars, trend_ma=20, vol_ma=20)
+    assert m["d30"]["panic"] and m["d30"]["vol_ratio"] == 2.0
+    assert m["d32"]["panic_recent"] and not m["d33"]["panic_recent"]   # 3거래일 창
+    assert not m["d34"]["panic"] and m["d29"]["trend"]
+
+
+def test_portfolio_market_filters_gate_entries():
+    from signals import market_indicators
+    from strategies import portfolio
+    data = {"A": _dip_series(30, 16), "B": _dip_series(30, 22), "C": _dip_series(34, 16)}
+    kw = dict(budget=1000, slots=2, rsi_max=20, trend_ma=20, fee_pct=0, slip_pct=0)
+    up = [mbar(f"d{i:02d}", 100 + i, 1000) for i in range(40)]
+    base = portfolio(data, **kw)
+    m_up = market_indicators(up, trend_ma=20)
+    assert portfolio(data, market=m_up, mfilter="trend", **kw)["trades"] == base["trades"]  # 상승장: 그대로
+    assert portfolio(data, market=m_up, mfilter="panic", **kw)["trades"] == []              # 투매 없음: 쉼
+    down = [mbar(f"d{i:02d}", 200 - i, 1000) for i in range(40)]
+    r = portfolio(data, market=market_indicators(down, trend_ma=20), mfilter="trend", **kw)
+    assert r["trades"] == [] and r["open_days"] == 0                                        # 하락장: 쉼
+    # 시장 과매도(계속 하락 → RSI 0): 종목 RSI 기준 없이 200일선 위 종목을 삼
+    r = portfolio(data, market=market_indicators(down, trend_ma=20), mfilter="mrsi", **kw)
+    assert len(r["trades"]) >= len(base["trades"])
