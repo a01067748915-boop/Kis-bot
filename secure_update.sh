@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 DIR="$(pwd)"
 BRANCH="${BRANCH:-claude/implementable-features-sq6aav}"
 BASE="https://raw.githubusercontent.com/a01067748915-boop/Kis-bot/${BRANCH}"
-FILES="bot.py kis_api.py signals.py check.py backtest.py strategies.py setup.sh requirements.txt .env.example .gitignore"
+FILES="bot.py kis_api.py signals.py report.py check.py backtest.py strategies.py setup.sh requirements.txt .env.example .gitignore"
 UNIT=/etc/systemd/system/kisbot.service
 BACKUP="${DIR}/backup/$(date +%Y%m%d-%H%M%S)"
 

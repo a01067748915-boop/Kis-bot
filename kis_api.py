@@ -212,15 +212,16 @@ class KIS:
                 }
         return result
 
-    def fills(self, ex, date):
-        """date(YYYYMMDD, 뉴욕 기준) 주문체결내역 → [{"odno", "side", "sym", "ord_qty", "qty", "price"}]
+    def fills(self, ex, date, end=None):
+        """date~end(YYYYMMDD, 뉴욕 기준, end 생략=하루) 주문체결내역
+        → [{"date", "odno", "side", "sym", "ord_qty", "qty", "price"}]
         side는 "buy"/"sell", qty·price는 체결수량·평균체결가"""
         mock = self.env == "mock"  # 모의투자는 전체조회만 지원
         data = self._request(
             "GET", "/uapi/overseas-stock/v1/trading/inquire-ccnl", TR["fills"][self.env],
             params={
                 "CANO": self.cano, "ACNT_PRDT_CD": self.prdt,
-                "PDNO": "" if mock else "%", "ORD_STRT_DT": date, "ORD_END_DT": date,
+                "PDNO": "" if mock else "%", "ORD_STRT_DT": date, "ORD_END_DT": end or date,
                 "SLL_BUY_DVSN": "00", "CCLD_NCCS_DVSN": "00",
                 "OVRS_EXCG_CD": "" if mock else ORDER_EXCH[ex], "SORT_SQN": "DS",
                 "ORD_DT": "", "ORD_GNO_BRNO": "", "ODNO": "",
@@ -231,6 +232,7 @@ class KIS:
         for o in data.get("output", []) or []:
             try:
                 out.append({
+                    "date": o.get("ord_dt", ""),
                     "odno": str(o.get("odno", "")),
                     "side": "sell" if o.get("sll_buy_dvsn_cd") == "01" else "buy",
                     "sym": o.get("pdno", ""),

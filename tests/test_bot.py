@@ -519,3 +519,30 @@ def test_kis_daily_history_pages_back(tmp_path):
     bars = api.daily_history("X", "NAS", 260)
     assert len(bars) >= 260 and bars == sorted(bars, key=lambda b: b["date"])
     assert len(calls) == 3 and calls[0] == ""
+
+
+# ─── 매매 기록 ───
+def test_report_summarizes_journal_and_telegram_command(make):
+    import report
+    b, api, tg = make()
+    b.step(at(9, 40))
+    api.prices["QQQM"] = 102.2
+    b.step(at(9, 41))
+    api.prices["QQQM"] = 105
+    b.step(at(15, 45))                     # 장마감 청산 → 이익
+    rows = report.load(b.journal_file)
+    assert [r["side"] for r in rows] == ["buy", "sell"] and not rows[0]["real"]  # DRY_RUN 기본
+    s = report.stats(rows)
+    assert s["sells"] == 1 and s["win"] == 100 and s["total"] > 0
+    text = report.summary_text(rows, "테스트")
+    assert "매수 1회 / 매도 1회" in text and "QQQM" in text
+    assert report.pick(rows, real=True) == [] and len(report.pick(rows, sym="qqqm")) == 2
+    tg.queue = ["/report"]
+    b.step(datetime(2026, 1, 6, 9, 0, tzinfo=ET))
+    assert any("최근 30일 모의(DRY_RUN)" in m for m in tg.sent)
+
+
+def test_report_empty(tmp_path):
+    import report
+    assert report.load(tmp_path / "none.csv") == []
+    assert "기록 없음" in report.summary_text([])

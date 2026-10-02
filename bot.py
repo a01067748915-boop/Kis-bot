@@ -42,6 +42,7 @@ import requests
 from dotenv import load_dotenv
 
 from kis_api import KIS, KISError, parse_targets
+import report
 from signals import indicators
 
 ET = ZoneInfo("America/New_York")
@@ -441,8 +442,20 @@ class Bot:
                 self.tg.send("▶️ 재개" + (" (오늘은 손실한도 도달로 신규 매수 없음)" if self.state["halted"] else ""))
             elif cmd == "/status":
                 self.tg.send(self.status_text())
+            elif cmd == "/report":
+                self.tg.send(self.report_text())
             elif cmd in ("/help", "/start"):
-                self.tg.send("/status 현황\n/pause 신규매수 중단\n/stop 전량매도+정지\n/resume 재개")
+                self.tg.send("/status 현황\n/report 최근 30일 매매 기록\n/pause 신규매수 중단\n"
+                             "/stop 전량매도+정지\n/resume 재개")
+
+    def report_text(self, days=30):
+        rows = report.pick(report.load(self.journal_file), days=days)
+        real = [r for r in rows if r["real"]]
+        sim = [r for r in rows if not r["real"]]
+        parts = [report.summary_text(real, f"최근 {days}일 실제 주문")] if real else []
+        if sim:
+            parts.append(report.summary_text(sim, f"최근 {days}일 모의(DRY_RUN)"))
+        return "\n\n".join(parts) or f"📒 최근 {days}일 매매 기록 없음"
 
     def status_text(self):
         s = self.state
