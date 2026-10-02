@@ -7,6 +7,7 @@
   python strategies.py --only pullback --targets SOXX:NAS,QQQM:NAS,AMD:NAS,PLTR:NAS
   python strategies.py --only portfolio --targets SOXX:NAS,SMH:NAS,AMD:NAS,PLTR:NAS,HOOD:NAS
   python strategies.py --only breakout --targets @universes/growth_balanced.txt --years 10
+  python strategies.py --only robust --targets @universes/growth_balanced.txt --add @universes/growth_extra.txt --years 10
 
 A. 눌림목 매수 (종목별, 며칠 보유)
    200일선 위(상승 추세)인데 RSI(2)가 기준 아래로 급락하면 다음 날 시가에 매수
@@ -456,6 +457,78 @@ def run_breakout(datasets, opts, budget):
             print(f"     칸 예산보다 비싸 한 번도 못 산 종목: {', '.join(sorted(r['skipped']))}")
 
 
+GRID_ENTRY = [10, 15, 20, 30, 40, 55]
+GRID_EXIT = [5, 7, 10, 15, 20]
+
+
+def _row(r, budget):
+    t = r["trades"]
+    n = len(t)
+    sm = summary([v / budget for v in r["curve"]])
+    avg = sum(x[0] for x in t) / n * 100 if n else 0
+    return sm, n, avg
+
+
+def run_robust(base, extra, opts, budget, slots=4):
+    """스윙 돌파 검증 3가지: ① 종목 묶음 바꿔도 이기는지 ② 설정값 근처도 비슷한지 ③ 최근에도 통하는지"""
+    allset = {**base, **extra}
+    start = common_start(allset)
+    print(f"\n━━ 스윙 돌파 검증 — 예산 {usd(budget)}, 기본 {slots}칸, 시작일 {start} ━━")
+
+    # ① 종목 묶음
+    print("\n① 종목 묶음별 (같은 시작일)")
+    groups = [(f"기존 {len(base)}종목", base)]
+    if extra:
+        groups += [(f"추가 {len(extra)}종목만", extra), (f"합계 {len(allset)}종목", allset)]
+    for gname, ds in groups:
+        ref = breakout_portfolio(ds, budget, slots=slots, entry_n=20, exit_n=10, start=start, **opts)
+        if not ref["dates"]:
+            print(f"  {gname}: 데이터 부족")
+            continue
+        hold, n_hold = hold_curve(ds, ref["dates"], budget, **opts)
+        print(f"  ■ {gname} — 균등 보유({n_hold}): {fmt(summary([v / budget for v in hold]))}")
+        for name, sl, en, ex in [("20/10", 2, 20, 10), ("20/10", slots, 20, 10), ("55/20", slots, 55, 20)]:
+            r = ref if (sl, en, ex) == (slots, 20, 10) else breakout_portfolio(
+                ds, budget, slots=sl, entry_n=en, exit_n=ex, start=start, **opts)
+            sm, n, avg = _row(r, budget)
+            print(f"    돌파{name} {sl}칸: {fmt(sm)}, 매매 {n}회, 1회평균 {avg:+.2f}% → 최종 {usd(r['curve'][-1])}")
+
+    # ② 설정값 그리드
+    ds = allset
+    print(f"\n② 설정값 그리드 ({len(ds)}종목, {slots}칸) — 칸마다 '연수익/최대낙폭' (%)")
+    print("  진입\\청산 " + "".join(f"{x:>4}일     " for x in GRID_EXIT))
+    for en in GRID_ENTRY:
+        cells = []
+        for ex in GRID_EXIT:
+            if ex >= en:
+                cells.append("    -      ")
+                continue
+            sm, n, _ = _row(breakout_portfolio(ds, budget, slots=slots, entry_n=en, exit_n=ex, start=start, **opts),
+                            budget)
+            cells.append(f"{sm['연']:+4.0f}/{sm['낙폭']:4.0f}  ")
+        print(f"  {en:>3}일    " + "".join(cells))
+    print("  → 한 칸만 튀지 않고 주변 칸도 고르게 좋으면 우연이 아닐 가능성이 큼")
+
+    # ③ 기간별
+    print(f"\n③ 기간별 ({len(ds)}종목) — 같은 규칙을 최근 구간에서 새로 시작했을 때")
+    full = breakout_portfolio(ds, budget, slots=slots, entry_n=20, exit_n=10, start=start, **opts)
+    if not full["dates"]:
+        print("  데이터 부족")
+        return
+    end = full["dates"][-1]
+    for label, years in [("전체", None), ("최근 4년", 4), ("최근 2년", 2), ("최근 1년", 1)]:
+        cut = start if years is None else f"{int(end[:4]) - years}{end[4:]}"
+        sub = [d for d in full["dates"] if d >= cut]
+        if len(sub) < 60:
+            continue
+        hold, _ = hold_curve(ds, sub, budget, **opts)
+        print(f"  ■ {label} ({sub[0]}~) 균등 보유: {fmt(summary([v / budget for v in hold]))}")
+        for sl, en, ex in [(2, 20, 10), (slots, 20, 10), (slots, 55, 20)]:
+            sm, n, avg = _row(breakout_portfolio(ds, budget, slots=sl, entry_n=en, exit_n=ex, start=sub[0], **opts),
+                              budget)
+            print(f"    돌파{en}/{ex} {sl}칸: {fmt(sm)}, 매매 {n}회, 1회평균 {avg:+.2f}%")
+
+
 def run_portfolio(datasets, opts, budget):
     print(f"\n━━ A'. 눌림목 매수 — 예산 {usd(budget)} 하나로 모든 종목 감시, 신호 난 종목에 칸 단위로 투입 ━━")
     print(f"  종목 {', '.join(datasets)} / 같은 날 여러 신호면 RSI 낮은 순 / 1주 단위 매수")
@@ -538,7 +611,7 @@ def main():
     p.add_argument("--add", help="portfolio 종목 수 비교: 기존 --targets 에 더할 종목, 예: NVDA:NAS,TSLA:NAS")
     p.add_argument("--market", default="SPY:AMS",
                    help="portfolio 시장 필터 기준 종목 (기본 SPY:AMS, none=비교 생략)")
-    p.add_argument("--only", choices=["pullback", "portfolio", "breakout", "trend", "rotation"],
+    p.add_argument("--only", choices=["pullback", "portfolio", "breakout", "robust", "trend", "rotation"],
                    help="한 전략만 실행")
     p.add_argument("--fee", type=float, default=None, help="편도 수수료(%%) 덮어쓰기")
     p.add_argument("--csv", nargs="+", help="date,open,high,low,close CSV 파일들로 테스트 (파일명=종목명)")
@@ -590,6 +663,10 @@ def main():
 
     print(f"\n수수료 편도 {opts['fee_pct']}%, 슬리피지 {opts['slip_pct']}%")
     stocks = {s: b for s, b in datasets.items() if s != safe}
+    if a.only == "robust":
+        run_robust(stocks, {} if a.csv else extra, opts, float(g("BUDGET_USD", "950")))
+        print("\n※ 과거 성과가 미래 수익을 보장하지 않습니다.")
+        return
     if a.add and not a.csv:
         run_universe(stocks, extra, opts, float(g("BUDGET_USD", "950")))
         print("\n※ 과거 성과가 미래 수익을 보장하지 않습니다.")

@@ -187,3 +187,22 @@ def test_breakout_indicators_and_portfolio():
     ret, days, _ = r["trades"][0]
     assert ret == pytest.approx(closes[42] / closes[31] - 1)  # d31 시가 매수 → d42 시가 매도
     assert days == 11
+
+
+def test_run_robust_smoke(capsys):
+    import random
+    from strategies import run_robust
+    random.seed(3)
+
+    def walk(drift):
+        p, out = 100.0, []
+        for i in range(700):
+            p *= 1 + random.gauss(drift, 0.02)
+            out.append(bar(f"2{i // 250:03d}{(i % 250) // 21 + 1:02d}{i % 21 + 1:02d}", p, p))
+        return out
+    base = {"A": walk(0.001), "B": walk(0.0)}
+    extra = {"C": walk(0.0005)}
+    run_robust(base, extra, {"fee_pct": 0.25, "slip_pct": 0.05}, 1100)
+    out = capsys.readouterr().out
+    assert "① 종목 묶음별" in out and "② 설정값 그리드" in out and "③ 기간별" in out
+    assert "합계 3종목" in out and "최근 1년" in out
