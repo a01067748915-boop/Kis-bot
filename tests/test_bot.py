@@ -546,3 +546,24 @@ def test_report_empty(tmp_path):
     import report
     assert report.load(tmp_path / "none.csv") == []
     assert "기록 없음" in report.summary_text([])
+
+
+def test_report_recovers_trades_from_bot_log(tmp_path):
+    import report
+    (tmp_path / "bot.log.1").write_text(
+        "2026-09-29 22:30:01,001 INFO [알림] 🤖 미국 단타 봇 시작 (실전) | 종목 SOFI, IONQ\n"
+        "2026-09-29 22:41:10,500 INFO [알림] 🟢 매수 SOFI 30주 @ $15.72 / 목표가 $15.70\n"
+        "2026-09-30 04:45:02,100 INFO [알림] 🔴 매도 SOFI 30주 @ ~$16.10 (장마감 청산) 손익 +9.05달러\n",
+        encoding="utf-8")
+    (tmp_path / "bot.log").write_text(
+        "2026-10-01 22:30:00,000 INFO [알림] 🤖 미국 주식 봇 시작 (실전, 주문없음(DRY_RUN)) | 전략: 눌림목\n"
+        "2026-10-01 22:36:00,000 INFO [알림] 🟢 매수 AMD 2주 @ $1,180.10 (주문 3주 중 일부) / 눌림목 RSI 4.3\n"
+        "2026-10-01 22:36:05,000 INFO 다른 로그 줄\n"
+        "2026-10-02 22:36:00,000 INFO [알림] 🔴 매도 AMD 2주 @ $1,176.00 (최대 보유 10일) 손익 -10.00달러 (잔량 1주 재시도)\n",
+        encoding="utf-8")
+    rows = report.load_log(tmp_path)
+    assert [(r["sym"], r["side"], r["real"]) for r in rows] == [
+        ("SOFI", "buy", True), ("SOFI", "sell", True), ("AMD", "buy", False), ("AMD", "sell", False)]
+    assert rows[0]["price"] == 15.72 and rows[1]["pnl"] == 9.05 and rows[2]["price"] == 1180.10
+    assert rows[2]["reason"] == "눌림목 RSI 4.3" and rows[3]["reason"] == "최대 보유 10일"
+    assert report.stats(report.pick(rows, real=True))["total"] == 9.05

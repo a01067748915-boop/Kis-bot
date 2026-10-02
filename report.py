@@ -7,6 +7,9 @@
   venv/bin/python report.py --sym SOXX   # 한 종목만
   venv/bin/python report.py --list 100   # 최근 100건 목록
   venv/bin/python report.py --kis 30     # 증권사 계좌의 최근 30일 실제 체결내역 (봇 이전·수동 매매 포함)
+  venv/bin/python report.py --log        # bot.log 의 매수·매도 알림에서 기록 복원 (trades.csv 생기기 전 매매 포함)
+
+trades.csv 가 없거나 비어 있으면 자동으로 bot.log 에서 찾아 보여줌
 
 텔레그램에서는 /report (최근 30일 요약)
 """
@@ -14,6 +17,7 @@
 import argparse
 import csv
 import json
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -33,6 +37,41 @@ def load(path=HERE / "trades.csv"):
         r["price"] = float(r.get("price") or 0)
         r["pnl"] = float(r["pnl"]) if r.get("pnl") not in (None, "") else None
         r["real"] = str(r.get("dry_run", "")).lower() == "false"
+    return rows
+
+
+BUY_RE = re.compile(r"🟢 매수 (\S+) (\d+)주 @ ~?\$([\d,.]+)(?: \(주문 \d+주 중 일부\))?(?: / (.*))?")
+SELL_RE = re.compile(r"🔴 매도 (\S+) (\d+)주 @ ~?\$([\d,.]+) \((.*?)\) 손익 ([+-][\d,.]+)달러")
+
+
+def load_log(folder=HERE):
+    """bot.log(회전된 bot.log.5 … bot.log.1 포함)의 텔레그램 알림 줄에서 매매 복원.
+    시각은 서버 시간, 모의 여부는 직전 '봇 시작' 알림의 DRY_RUN 표시로 판단"""
+    folder = Path(folder)
+    files = sorted(folder.glob("bot.log.*"), key=lambda f: -int(f.suffix[1:]) if f.suffix[1:].isdigit() else 0)
+    files += [folder / "bot.log"]
+    rows, dry = [], True
+    for f in files:
+        if not f.exists():
+            continue
+        for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "[알림]" not in line:
+                continue
+            when, msg = line[:19], line.split("[알림] ", 1)[1]
+            if "봇 시작" in msg:
+                dry = "DRY_RUN" in msg
+                continue
+            m = BUY_RE.search(msg)
+            if m:
+                rows.append({"time_et": when, "sym": m[1], "side": "buy", "qty": int(m[2]),
+                             "price": float(m[3].replace(",", "")), "pnl": None,
+                             "reason": (m[4] or "").strip(), "real": not dry})
+                continue
+            m = SELL_RE.search(msg)
+            if m:
+                rows.append({"time_et": when, "sym": m[1], "side": "sell", "qty": int(m[2]),
+                             "price": float(m[3].replace(",", "")), "pnl": float(m[5].replace(",", "")),
+                             "reason": m[4], "real": not dry})
     return rows
 
 
@@ -97,7 +136,7 @@ def holdings_text(state_file=HERE / "state.json"):
         f"{s} {p['qty']}주 @ ${p['entry']:,.2f}" + (f" ({p['days']}일째)" if "days" in p else "") for s, p in pos.items())
 
 
-def print_report(rows, list_n):
+def print_report(rows, list_n, tz="뉴욕 시간"):
     for label, real in (("실제 주문", True), ("모의 (DRY_RUN, 주문 없음)", False)):
         part = [r for r in rows if r["real"] == real]
         if part:
@@ -107,10 +146,10 @@ def print_report(rows, list_n):
                 print("월별: " + ", ".join(f"{m} {t:+,.0f}({n}회, 승률 {w / n * 100:.0f}%)"
                                          for m, (n, t, w) in sorted(months.items())))
     if not rows:
-        print("\n📒 기록 없음 — 봇이 매매하면 trades.csv 에 쌓입니다.")
+        print("\n📒 기록 없음 — 봇이 아직 사거나 판 적이 없습니다. (신호가 나면 trades.csv 에 쌓입니다)")
     print("\n" + holdings_text())
     if rows and list_n:
-        print(f"\n최근 {min(list_n, len(rows))}건 (뉴욕 시간)")
+        print(f"\n최근 {min(list_n, len(rows))}건 ({tz})")
         for r in rows[-list_n:]:
             pnl = f" 손익 {r['pnl']:+,.2f}" if r["pnl"] is not None else ""
             tag = "" if r["real"] else " [모의]"
@@ -158,9 +197,16 @@ def main():
     p.add_argument("--sym", help="한 종목만")
     p.add_argument("--list", type=int, default=20, help="목록 건수 (0=목록 생략)")
     p.add_argument("--kis", type=int, metavar="N", help="증권사 계좌의 최근 N일 체결내역도 조회")
+    p.add_argument("--log", action="store_true", help="trades.csv 대신 bot.log 에서 기록 복원")
     a = p.parse_args()
-    rows = pick(load(), a.days, True if a.real else None, a.sym)
-    print_report(rows, a.list)
+    rows, tz = ([] if a.log else load()), "뉴욕 시간"
+    if not rows:
+        tz = "서버 시간"
+        rows = load_log()
+        why = "--log 지정" if a.log else "trades.csv 없음/비어 있음"
+        print(f"ℹ️ {why} → bot.log 의 매수·매도 알림 {len(rows)}건에서 복원 (시각=서버 시간)")
+    rows = pick(rows, a.days, True if a.real else None, a.sym)
+    print_report(rows, a.list, tz)
     if a.kis:
         print_kis(a.kis)
 
