@@ -129,10 +129,18 @@ class Telegram:
         if not self.enabled:
             return
         try:
-            requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage",
-                          json={"chat_id": self.chat, "text": text}, timeout=10)
+            res = requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage",
+                                json={"chat_id": self.chat, "text": text}, timeout=10)
         except requests.RequestException as e:
             log.warning("텔레그램 전송 실패: %s", self._safe(e))
+            return
+        if res.status_code != 200:  # 토큰 틀림(401), 봇과 대화 시작 안 함(403), 채팅 ID 틀림(400) 등
+            try:
+                why = res.json().get("description", "")
+            except ValueError:
+                why = res.text[:100]
+            log.warning("텔레그램 전송 거부 %s: %s — 토큰·채팅ID 확인, 새 봇이면 텔레그램에서 /start", res.status_code,
+                        self._safe(why))
 
     def commands(self):
         if not self.enabled:

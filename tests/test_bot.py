@@ -591,3 +591,18 @@ def test_kis_daily_history_stitches_split_adjustment(tmp_path):
     assert [b["date"] for b in bars] == days
     assert max(abs(b["close"] / a - 1) for b, a in zip(bars, adj)) < 1e-9
     assert bars[0]["volume"] == pytest.approx(1000)  # 가격을 1/10로 맞추면 주식 수 기준 거래량은 10배
+
+
+def test_telegram_logs_rejected_send(monkeypatch, caplog):
+    class R:
+        status_code = 403
+
+        def json(self):
+            return {"ok": False, "description": "Forbidden: bot can't initiate conversation with a user"}
+
+    monkeypatch.setattr(botmod.requests, "post", lambda *a, **k: R())
+    tg = Telegram("SECRET:TOKEN", "1")
+    with caplog.at_level("WARNING"):
+        tg.send("hi")
+    assert "텔레그램 전송 거부 403" in caplog.text and "initiate conversation" in caplog.text
+    assert "SECRET:TOKEN" not in caplog.text
