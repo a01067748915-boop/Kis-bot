@@ -20,6 +20,7 @@
 
 import argparse
 import csv
+import json
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -29,10 +30,25 @@ from dotenv import load_dotenv
 HERE = Path(__file__).resolve().parent
 
 
-def fetch_bars(api, sym, ex, years):
-    """KIS 미국 일봉 최근 years년 (100일 단위로 이어 붙이며 분할 기준 차이 보정)"""
+def fetch_bars(api, sym, ex, years, adjusted=True, cache=HERE / "data" / "kis"):
+    """KIS 미국 일봉 최근 years년 (100일 단위로 이어 붙이며 분할 기준 차이 보정)
+    adjusted=False 면 그날 실제 가격(분할 미반영). 받은 결과는 그날 하루 동안 저장해 다시 실행할 때 재사용"""
     limit = (datetime.now() - timedelta(days=365 * years)).strftime("%Y%m%d")
-    return api.daily_history(sym, ex, since=limit)
+    path = Path(cache) / f"{sym}_{ex}_{'adj' if adjusted else 'raw'}_{years}y.json" if cache else None
+    today = datetime.now().strftime("%Y%m%d")
+    if path and path.exists():
+        try:
+            saved = json.loads(path.read_text())
+            if saved.get("day") == today:
+                return saved["bars"]
+        except (ValueError, KeyError):
+            pass
+    bars = api.daily_history(sym, ex, since=limit) if adjusted else api.daily_history(sym, ex, since=limit,
+                                                                                      adjusted=False)
+    if path and bars:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"day": today, "bars": bars}))
+    return bars
 
 
 def load_csv(path):

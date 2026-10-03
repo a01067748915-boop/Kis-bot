@@ -115,3 +115,67 @@ def test_factor_portfolio_monthly_top_n_and_ranks():
     assert set(ranks) == {"A", "B"}                           # 점수 하나라도 없으면 제외
     sig = analysis.signal_portfolio(ds, lambda b: macd_indicators(b), 1000, slots=2, fee_pct=0, slip_pct=0)
     assert sig["dates"] and isinstance(sig["trades"], list)
+
+
+def test_real_price_sizing_blocks_unaffordable_shares_before_split():
+    from strategies import slot_engine
+    closes = [100 + i for i in range(60)]
+    adj = bars_from(closes)
+    split_at = 30  # 이전엔 실제 가격이 10배 (10:1 분할 전)
+    raw = [dict(b, open=b["open"] * (10 if i < split_at else 1), close=b["close"] * (10 if i < split_at else 1))
+           for i, b in enumerate(adj)]
+    ind = {"X": {b["date"]: {} for b in adj}}
+    run = lambda raw_: slot_engine({"X": adj}, ind, 500, 1, lambda s, y, p: False,
+                                   lambda y, d, ready, held: ["X"] if ready("X", d) else [],
+                                   fee_pct=0, slip_pct=0, raw=raw_)
+    plain, real = run(None), run({"X": raw})
+    assert plain["skips"] == 0 and plain["open"] == 1             # 수정주가로는 첫날부터 매수
+    assert real["skips"] >= split_at - 2 and real["open"] == 1      # 분할 전엔 실제 1주(1,000달러대)를 못 삼
+    # 분할 뒤 실제 가격으로 산 주식 수 = 500 // 그날 실제 가격, 남은 돈은 현금
+    buy = next(i for i in range(len(adj)) if i >= split_at - 1 and 500 // raw[i]["open"] > 0)
+    shares = 500 // raw[buy]["open"]
+    expect = 500 - shares * raw[buy]["open"] + shares * adj[-1]["close"] * raw[buy]["open"] / adj[buy]["open"]
+    assert real["curve"][-1] == pytest.approx(expect)
+
+
+def test_fetch_bars_cache(tmp_path):
+    from backtest import fetch_bars
+
+    class A:
+        calls = 0
+
+        def daily_history(self, sym, ex, since=None, adjusted=True):
+            A.calls += 1
+            return [{"date": "20260101", "close": 1.0 if adjusted else 10.0}]
+    a = A()
+    assert fetch_bars(a, "X", "NAS", 1, cache=tmp_path)[0]["close"] == 1.0
+    assert fetch_bars(a, "X", "NAS", 1, adjusted=False, cache=tmp_path)[0]["close"] == 10.0
+    fetch_bars(a, "X", "NAS", 1, cache=tmp_path)
+    assert A.calls == 2                                              # 같은 날 다시 부르면 저장분 사용
+
+
+def test_run_verify_smoke(capsys):
+    import random
+    random.seed(4)
+
+    def walk(drift):
+        p, cl = 100.0, []
+        for _ in range(500):
+            p *= 1 + drift + random.gauss(0, 0.015)
+            cl.append(p)
+        return bars_from(cl)
+    ds = {f"S{i}": walk(random.gauss(0.0005, 0.001)) for i in range(10)}
+    raw = {s: b for s, b in ds.items()}
+
+    class F:
+        def __init__(self, g):
+            self.g, self.rev = g, [1]
+
+        def growth(self, y):
+            return self.g
+    funds = {s: F(random.random()) for s in ds}
+    groups = [("A", {s: ds[s] for s in list(ds)[:5]}), ("B", {s: ds[s] for s in list(ds)[5:]}), ("합계", ds)]
+    analysis.run_verify(groups, raw, funds, 1100, {"fee_pct": 0.25, "slip_pct": 0.05})
+    out = capsys.readouterr().out
+    assert "① 종목 묶음별" in out and "② 설정값" in out and "③ 실제 가격 반영 효과" in out
+    assert "모멘텀+매출성장" in out and "12개월" in out

@@ -49,7 +49,7 @@ def signal_portfolio(datasets, ind_fn, budget, slots=SLOTS, need_trend=True, sta
     return slot_engine(datasets, ind, budget, slots, wants_exit, candidates, start=start, **opts)
 
 
-def factor_portfolio(datasets, score, budget, slots=SLOTS, need_trend=False, start=None, ind=None, **opts):
+def factor_portfolio(datasets, score, budget, slots=SLOTS, need_trend=False, start=None, ind=None, raw=None, **opts):
     """매달 첫 거래일 score(종목, 전날) 높은 순 상위 slots 개로 교체. score 가 None 이면 제외"""
     ind = ind or {s: indicators(b, 200) for s, b in datasets.items()}
     state = {"month": None, "target": []}
@@ -75,7 +75,7 @@ def factor_portfolio(datasets, score, budget, slots=SLOTS, need_trend=False, sta
         update(y)
         return [s for s in state["target"] if s not in held and ready(s, d)]
 
-    return slot_engine(datasets, ind, budget, slots, wants_exit, candidates, start=start, **opts)
+    return slot_engine(datasets, ind, budget, slots, wants_exit, candidates, start=start, raw=raw, **opts)
 
 
 def momentum_score(datasets, n=126):
@@ -219,12 +219,100 @@ def run_fund(datasets, edgar, budget, opts, start, starts=None, dates=None):
             ds, sc, budget, need_trend=tr, start=st, ind=base, **opts), starts), budget))
 
 
+# ─── 검증: 모멘텀 · 매출성장 상위 N ─────────────────
+def load_funds(datasets, edgar):
+    from fundamentals import Fundamentals
+    funds = {}
+    for s in datasets:
+        try:
+            f = edgar.facts(s)
+        except RuntimeError as e:
+            print(f"  ⚠️ {s} 재무 받기 실패: {e}")
+            continue
+        fu = Fundamentals(f) if f else None
+        if fu and fu.rev:
+            funds[s] = fu
+    return funds
+
+
+def growth_score(funds):
+    def score(s, y):
+        return funds[s].growth(y) if s in funds else None
+    return score
+
+
+def combo_score(names, *scores):
+    cache = {}
+
+    def score(s, y):
+        if y not in cache:
+            cache[y] = _ranks(names, y, scores)
+        return cache[y].get(s)
+    return score
+
+
+def cell(r, budget):
+    sm = summary([v / budget for v in r["curve"]])
+    return f"연{sm['연']:+.0f}/{sm['낙폭']:.0f}"
+
+
+def run_verify(groups, raw, funds, budget, opts):
+    """groups: [(이름, {종목: 일봉})] — 마지막이 전체. raw: 실제 가격 일봉"""
+    full = groups[-1][1]
+    start = common_start(full)
+    print(f"\n━━ 검증: 모멘텀 · 매출성장 상위 N (매달 교체, {usd(budget)}, 실제 가격으로 1주 단위) ━━")
+    print("  표기: 구간별 '연수익/최대낙폭' (%). 실제가격 = 그날 실제 주가로 살 수 있는 만큼만 매수")
+
+    def strategies_for(ds, n=SLOTS, mom_n=126):
+        names = list(ds)
+        g = growth_score(funds)
+        m = momentum_score(ds, mom_n)
+        return [("모멘텀", m), ("매출성장", g), ("모멘텀+매출성장", combo_score(names, m, g))]
+
+    # ① 종목 묶음
+    print("\n① 종목 묶음별 (상위 4, 실제가격)")
+    for gname, ds in groups:
+        ref = factor_portfolio(ds, momentum_score(ds), budget, start=start, raw=raw, **opts)
+        if not ref["dates"]:
+            print(f"  {gname}: 데이터 부족")
+            continue
+        starts = periods(ref["dates"])
+        print(f"  ■ {gname} ({len(ds)}종목)")
+        print("  " + hold_line(ds, starts, ref["dates"], budget, opts))
+        base = {s: indicators(b, 200) for s, b in ds.items()}
+        for name, sc in strategies_for(ds):
+            print("  " + line(name, run_all(lambda st, sc=sc: factor_portfolio(
+                ds, sc, budget, start=st, ind=base, raw=raw, **opts), starts), budget))
+
+    # ② 설정값
+    base = {s: indicators(b, 200) for s, b in full.items()}
+    print(f"\n② 설정값 ({len(full)}종목, 실제가격, 전체 기간) — '연수익/최대낙폭'")
+    print("  모멘텀 기간 \\ 상위   3개         4개         6개")
+    for label, n in (("3개월", 63), ("6개월", 126), ("12개월", 252)):
+        cells = [cell(factor_portfolio(full, momentum_score(full, n), budget, slots=k, start=start, ind=base,
+                                       raw=raw, **opts), budget) for k in (3, 4, 6)]
+        print(f"  {label:<8}            " + "   ".join(f"{c:<10}" for c in cells))
+    cells = [cell(factor_portfolio(full, growth_score(funds), budget, slots=k, start=start, ind=base, raw=raw,
+                                   **opts), budget) for k in (3, 4, 6)]
+    print(f"  {'매출성장':<8}           " + "   ".join(f"{c:<10}" for c in cells))
+    print("  → 칸마다 비슷하게 좋으면 설정을 운 좋게 고른 게 아님. 6개는 칸당 금액이 작아 1주 못 사는 경우가 늘어남")
+
+    # ③ 실제 가격 반영 효과
+    print(f"\n③ 실제 가격 반영 효과 ({len(full)}종목, 상위 4, 전체 기간)")
+    for name, sc in strategies_for(full):
+        a = factor_portfolio(full, sc, budget, start=start, ind=base, **opts)
+        b = factor_portfolio(full, sc, budget, start=start, ind=base, raw=raw, **opts)
+        print(f"  {name:<14}: 수정주가 기준 {cell(a, budget)} → 실제가격 기준 {cell(b, budget)}"
+              f" (1주 못 사 건너뛴 횟수 {b['skips']}, 끝내 못 산 종목 {len(b['skipped'])}개)")
+    print("  → 차이가 크면 백테스트가 소액 계좌에서 실제로는 불가능한 매수를 가정했던 것")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--targets", default="@universes/growth_balanced.txt")
     p.add_argument("--add", default="@universes/growth_extra.txt", help="함께 쓸 종목 (none=안 씀)")
     p.add_argument("--years", type=int, default=10)
-    p.add_argument("--only", choices=["tech", "fund"])
+    p.add_argument("--only", choices=["tech", "fund", "verify"])
     p.add_argument("--fee", type=float, default=None)
     a = p.parse_args()
 
@@ -246,6 +334,25 @@ def main():
         datasets[sym] = bars
     budget = float(g("BUDGET_USD", "950"))
     opts = {"fee_pct": a.fee if a.fee is not None else float(g("FEE_PCT", "0.25")), "slip_pct": 0.05}
+    if a.only == "verify":
+        from fundamentals import Edgar
+        edgar = Edgar(g("SEC_USER_AGENT"))
+        raw = {}
+        for sym, ex in targets.items():
+            if sym in datasets:
+                print(f"{sym} 실제 가격(분할 미반영) 수집 중…")
+                raw[sym] = fetch_bars(api, sym, ex, a.years, adjusted=False)
+        print("SEC 재무제표 확인 중…")
+        funds = load_funds(datasets, edgar)
+        base_syms = set(parse_targets(a.targets))
+        add_syms = set(targets) - base_syms
+        groups = [(f"기본 목록({a.targets})", {s: b for s, b in datasets.items() if s in base_syms})]
+        if add_syms:
+            groups.append((f"추가 목록({a.add})", {s: b for s, b in datasets.items() if s in add_syms}))
+            groups.append(("합계", datasets))
+        run_verify(groups, raw, funds, budget, opts)
+        print("\n※ 과거 성과가 미래 수익을 보장하지 않습니다.")
+        return
     start = common_start(datasets)
     print(f"\n{len(datasets)}종목, 시작 {start}, 수수료 편도 {opts['fee_pct']}%")
     starts = dates = None

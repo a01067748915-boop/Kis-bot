@@ -166,12 +166,13 @@ class KIS:
             raise KISError(f"{sym}({ex}) 현재가 없음 — 종목/거래소 코드를 확인하세요")
         return float(last)
 
-    def daily_bars(self, sym, ex, base_date=""):
+    def daily_bars(self, sym, ex, base_date="", adjusted=True):
         """base_date(YYYYMMDD, 빈값=오늘)부터 과거로 일봉 최대 100개. 오래된 순으로 반환
+        adjusted=False 면 분할 등을 반영하지 않은 그날 실제 가격
         ※ 거래소 코드가 틀리면 오류 없이 빈 목록이 옴"""
         data = self._request(
             "GET", "/uapi/overseas-price/v1/quotations/dailyprice", "HHDFS76240000",
-            params={"AUTH": "", "EXCD": ex, "SYMB": sym, "GUBN": "0", "BYMD": base_date, "MODP": "1"},
+            params={"AUTH": "", "EXCD": ex, "SYMB": sym, "GUBN": "0", "BYMD": base_date, "MODP": "1" if adjusted else "0"},
         )
         bars = []
         for b in data.get("output2", []) or []:
@@ -184,13 +185,13 @@ class KIS:
                 continue
         return sorted(bars, key=lambda x: x["date"])
 
-    def daily_history(self, sym, ex, count=260, since=None):
+    def daily_history(self, sym, ex, count=260, since=None, adjusted=True):
         """최근 일봉 count개 이상 또는 since(YYYYMMDD)까지 — 100개씩 과거로 이어 붙임. 오래된 순
         조각마다 수정주가 기준일이 달라 분할(10:1 등) 전후 가격이 어긋날 수 있어,
         하루씩 겹치게 받아 겹친 날 종가가 같도록 오래된 조각을 비율로 맞춤"""
         bars, base = [], ""
         for _ in range(500):
-            chunk = self.daily_bars(sym, ex, base)
+            chunk = self.daily_bars(sym, ex, base) if adjusted else self.daily_bars(sym, ex, base, adjusted=False)
             if not bars:
                 older = chunk
             else:

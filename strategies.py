@@ -216,10 +216,12 @@ def run_pullback(datasets, opts):
 
 # ─── A'. 눌림목 매수 — 예산을 모아 쓰는 포트폴리오 ─────
 def slot_engine(datasets, ind, budget, slots, wants_exit, candidates, fee_pct=0.25, slip_pct=0.05,
-                whole_shares=True, start=None, date_ok=None):
+                whole_shares=True, start=None, date_ok=None, raw=None):
     """예산 하나를 slots 칸으로 나눠 운용하는 공통 엔진 (매매는 모두 그날 시가, 신호는 전날 종가 기준)
     ind[s][날짜]: 종목별 지표 / wants_exit(s, y, pos) → 매도 사유 여부 / candidates(y, d, ready, held) → 매수 우선순위 목록
-    date_ok(y) → 그날 진행 여부(시장 데이터 등) / 1주 단위 매수, 칸 예산으로 1주도 못 사면 다음 후보"""
+    date_ok(y) → 그날 진행 여부(시장 데이터 등) / 1주 단위 매수, 칸 예산으로 1주도 못 사면 다음 후보
+    raw: {종목: 실제 가격 일봉} 을 주면 '그날 실제 가격으로 몇 주 살 수 있었나'로 수량을 정함
+         (수익률은 수정주가로 계산 — 분할일의 가격 급변을 손익으로 착각하지 않게)"""
     fee, slip = fee_pct / 100, slip_pct / 100
     px = {s: by_date(b) for s, b in datasets.items()}
     cal = sorted(set().union(*(set(v) for v in px.values())))
@@ -231,7 +233,8 @@ def slot_engine(datasets, ind, budget, slots, wants_exit, candidates, fee_pct=0.
     if start is None:
         start = next((d for d in cal[1:] if all(ready(s, d) for s in px)), None)
     dates = [d for d in cal[1:] if start and d >= start and (date_ok is None or date_ok(prev_of[d]))]
-    cash, pos, curve, trades, used, last, skipped = budget, {}, [], [], 0, {}, set()
+    cash, pos, curve, trades, used, last, skipped, skips = budget, {}, [], [], 0, {}, set(), 0
+    rawpx = {s: by_date(b) for s, b in raw.items()} if raw else None
     for d in dates:
         y = prev_of[d]
         # 1) 매도 (거래정지 등 시세 없는 날은 보류)
@@ -250,9 +253,18 @@ def slot_engine(datasets, ind, budget, slots, wants_exit, candidates, fee_pct=0.
                 break
             price = px[s][d]["open"] * (1 + slip)
             alloc = min(equity_open / slots, cash)
-            qty = int(alloc * (1 - fee) / price) if whole_shares else alloc * (1 - fee) / price
-            if qty <= 0:
+            if rawpx is not None:
+                rb = rawpx.get(s, {}).get(d)
+                if not rb:
+                    continue
+                real = rb["open"] * (1 + slip)
+                n = int(alloc * (1 - fee) / real)
+                qty = n * real / price  # 실제로 산 주식 수를 수정주가 단위로 환산
+            else:
+                n = qty = int(alloc * (1 - fee) / price) if whole_shares else alloc * (1 - fee) / price
+            if n <= 0:
                 skipped.add(s)
+                skips += 1
                 continue
             cost = qty * price / (1 - fee)
             cash -= cost
@@ -264,7 +276,7 @@ def slot_engine(datasets, ind, budget, slots, wants_exit, candidates, fee_pct=0.
         curve.append(cash + sum(p["qty"] * last[s] for s, p in pos.items()))
     n = max(1, len(dates))
     return {"dates": dates, "curve": curve, "trades": trades, "used": used / n / slots, "open": len(pos),
-            "skipped": skipped - {t[2] for t in trades}}
+            "skipped": skipped - {t[2] for t in trades}, "skips": skips}
 
 
 def portfolio(datasets, budget=950.0, slots=2, rsi_max=10, trend_ma=200, max_days=10,
