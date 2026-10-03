@@ -279,3 +279,29 @@ def test_run_growthfix_ranks_picks(capsys):
     assert "JOBY 순위 밖" in rows["매출성장 1년전≥1천만$"]          # 거의 0에서 튄 성장은 기준에 걸림
     assert "JOBY 순위 밖" in rows["+상한300%"]                       # 1천만$ 기준 + 상한 → 기준에서 걸림
     assert "ACHR 순위 밖" in rows["매출성장 조건없음"]
+
+
+def test_run_stress_smoke(capsys):
+    import random
+    random.seed(11)
+
+    def walk(d):
+        p, cl = 100.0, []
+        for _ in range(520):
+            p *= 1 + d + random.gauss(0, 0.015)
+            cl.append(p)
+        return bars_from(cl)
+    full = {f"S{i:02d}": walk(random.gauss(0.0004, 0.001)) for i in range(14)}
+
+    class F:
+        def __init__(self, g):
+            self.g, self.rev = g, [1]
+
+        def growth(self, y, min_prev=None, cap=None):
+            return self.g + (int(y[4:6]) % 3) * 0.3   # 달마다 순위가 바뀌게
+    funds = {s: F(random.random()) for s in full}
+    analysis.run_stress(full, full, funds, 1100, {"fee_pct": 0.25, "slip_pct": 0.05}, trials=4, size=8)
+    out = capsys.readouterr().out
+    assert "① 큰 승자 빼기" in out and "상위 10 제외" in out and "가장 많이 번 5종목 제외" in out
+    assert "② 무작위 8종목 × 4회" in out and "보유보다 높은 경우" in out
+    assert analysis._pct([1, 2, 3, 4, 5], 0.5) == 3

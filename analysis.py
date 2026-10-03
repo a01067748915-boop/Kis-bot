@@ -388,6 +388,91 @@ def run_garp(groups, raw, funds, budget, opts, picks=()):
             print(f"      과거에 고른 규칙: {', '.join(chosen) if chosen else '없음'}")
 
 
+# ─── 견고성: 큰 승자 빼기 · 무작위 묶음 ─────────────────
+def _pct(xs, q):
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, max(0, int(round(q * (len(xs) - 1)))))]
+
+
+def contributors(r, k=5):
+    """전략이 실제로 번 종목 순위 (끝난 매매 수익률 합)"""
+    tot = {}
+    for ret, _, sym in r["trades"]:
+        tot[sym] = tot.get(sym, 0.0) + ret
+    return [s for s, v in sorted(tot.items(), key=lambda x: -x[1])[:k]]
+
+
+def run_stress(full, raw, funds, budget, opts, trials=200, size=40, seed=1):
+    import random
+    start = common_start(full)
+    base_ind = {s: indicators(b, 200) for s, b in full.items()}  # 한 번만 계산해 재사용
+
+    def strat(ds, name):
+        sc = momentum_score(ds) if name == "모멘텀" else growth_score(funds)
+        sub = {s: base_ind[s] for s in ds}
+        return lambda st: factor_portfolio(ds, sc, budget, start=st, ind=sub, raw=raw, **opts)
+
+    names = ["모멘텀", "매출성장"]
+    ref = strat(full, "모멘텀")(start)
+    dates = ref["dates"]
+    if not dates:
+        print("  데이터 부족")
+        return
+    starts = periods(dates)
+    print(f"\n━━ 견고성 검증 ({len(full)}종목, 매달 상위 {SLOTS}, {usd(budget)}, 실제 가격, 매출성장은 1년전≥1천만$) ━━")
+
+    # ① 큰 승자 빼기
+    first = {s: next((b for b in bs if b["date"] >= dates[0]), None) for s, bs in full.items()}
+    hold_ret = {s: bs[-1]["close"] / first[s]["open"] - 1 for s, bs in full.items() if first[s]}
+    winners = [s for s, _ in sorted(hold_ret.items(), key=lambda x: -x[1])]
+    print("\n① 큰 승자 빼기")
+    print("  보유 수익 상위 10: " + ", ".join(f"{s}({hold_ret[s] * 100:+,.0f}%)" for s in winners[:10]))
+    for label, drop in (("전체", []), ("상위 5 제외", winners[:5]), ("상위 10 제외", winners[:10])):
+        ds = {s: b for s, b in full.items() if s not in drop}
+        print(f"  ■ {label} ({len(ds)}종목)")
+        print("  " + hold_line(ds, starts, dates, budget, opts))
+        for n in names:
+            print("  " + line(n, run_all(strat(ds, n), starts), budget))
+    for n in names:
+        top = contributors(strat(full, n)(start))
+        if not top:
+            print(f"  ■ {n}: 끝난 매매가 없어 기여 종목 제외 검사 생략")
+            continue
+        ds = {s: b for s, b in full.items() if s not in top}
+        print(f"  ■ {n}이 가장 많이 번 5종목 제외: {', '.join(top)}")
+        print("  " + hold_line(ds, starts, dates, budget, opts))
+        print("  " + line(n, run_all(strat(ds, n), starts), budget))
+
+    # ② 무작위 묶음
+    rng = random.Random(seed)
+    pool = sorted(full)
+    size = min(size, len(pool))
+    print(f"\n② 무작위 {size}종목 × {trials}회 (전체 기간, 뽑는 순서 고정 seed={seed})")
+    res = {n: {"ex": [], "mdd": []} for n in names}
+    hold_mdd = []
+    for t in range(trials):
+        pick = rng.sample(pool, size)
+        ds = {s: full[s] for s in pick}
+        hc, _ = hold_curve(ds, dates, budget, **opts)
+        hs = summary([v / budget for v in hc])
+        hold_mdd.append(hs["낙폭"])
+        for n in names:
+            r = strat(ds, n)(start)
+            sm = summary([v / budget for v in r["curve"]])
+            res[n]["ex"].append(sm["연"] - hs["연"])
+            res[n]["mdd"].append(sm["낙폭"])
+        if (t + 1) % 50 == 0:
+            print(f"    … {t + 1}/{trials}회")
+    print(f"  균등 보유 최대낙폭 중앙값 {_pct(hold_mdd, 0.5):.0f}%")
+    for n in names:
+        ex = res[n]["ex"]
+        win = sum(x > 0 for x in ex) / len(ex) * 100
+        print(f"  {n:<6}: 보유보다 높은 경우 {win:.0f}% | 연수익 차이 중앙값 {_pct(ex, 0.5):+.0f}%p"
+              f" (하위10% {_pct(ex, 0.1):+.0f}%p ~ 상위10% {_pct(ex, 0.9):+.0f}%p)"
+              f" | 최대낙폭 중앙값 {_pct(res[n]['mdd'], 0.5):.0f}%")
+    print("  → '보유보다 높은 경우'가 80% 이상이고 하위10%도 0 근처면, 특정 종목 구성에 기대지 않는 전략")
+
+
 def cell(r, budget):
     sm = summary([v / budget for v in r["curve"]])
     return f"연{sm['연']:+.0f}/{sm['낙폭']:.0f}"
@@ -449,7 +534,9 @@ def main():
     p.add_argument("--targets", default="@universes/growth_balanced.txt")
     p.add_argument("--add", default="@universes/growth_extra.txt", help="함께 쓸 종목 (none=안 씀)")
     p.add_argument("--years", type=int, default=10)
-    p.add_argument("--only", choices=["tech", "fund", "verify", "garp", "growthfix"])
+    p.add_argument("--only", choices=["tech", "fund", "verify", "garp", "growthfix", "stress"])
+    p.add_argument("--trials", type=int, default=200, help="stress: 무작위 묶음 반복 횟수")
+    p.add_argument("--size", type=int, default=40, help="stress: 무작위 묶음 종목 수")
     p.add_argument("--picks", default="@universes/my_picks.txt", help="관심 종목 (garp 에서 따로 점검, none=안 씀)")
     p.add_argument("--fee", type=float, default=None)
     a = p.parse_args()
@@ -476,7 +563,7 @@ def main():
         datasets[sym] = bars
     budget = float(g("BUDGET_USD", "950"))
     opts = {"fee_pct": a.fee if a.fee is not None else float(g("FEE_PCT", "0.25")), "slip_pct": 0.05}
-    if a.only in ("verify", "garp", "growthfix"):
+    if a.only in ("verify", "garp", "growthfix", "stress"):
         from fundamentals import Edgar
         edgar = Edgar(g("SEC_USER_AGENT"))
         raw = {}
@@ -497,6 +584,8 @@ def main():
             run_garp(groups, raw, funds, budget, opts, list(picks))
         elif a.only == "growthfix":
             run_growthfix(groups, raw, funds, budget, opts, list(picks))
+        elif a.only == "stress":
+            run_stress(datasets, raw, funds, budget, opts, a.trials, a.size)
         else:
             run_verify(groups, raw, funds, budget, opts)
         print("\n※ 과거 성과가 미래 수익을 보장하지 않습니다.")
