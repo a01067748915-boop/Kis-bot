@@ -171,7 +171,7 @@ def test_run_verify_smoke(capsys):
         def __init__(self, g):
             self.g, self.rev = g, [1]
 
-        def growth(self, y):
+        def growth(self, y, min_prev=None, cap=None):
             return self.g
     funds = {s: F(random.random()) for s in ds}
     groups = [("A", {s: ds[s] for s in list(ds)[:5]}), ("B", {s: ds[s] for s in list(ds)[5:]}), ("합계", ds)]
@@ -212,7 +212,7 @@ def test_garp_rules_and_picks_check(capsys):
         def __init__(self, g, rev):
             self.g, self.rev_, self.rev = g, rev, [1]
 
-        def growth(self, y):
+        def growth(self, y, min_prev=None, cap=None):
             return self.g
 
         def revenue(self, y):
@@ -232,3 +232,50 @@ def test_garp_rules_and_picks_check(capsys):
     out = capsys.readouterr().out
     assert "A 덜오른고성장" in out and "관심 종목 점검" in out
     assert "JOBY: 데이터" in out and "A·B·C 에서 제외" in out and "ACHR: 시세 없음" in out
+
+
+def test_growth_floor_and_cap():
+    def yr(y, v):
+        return [q(f"{y}-01-01", f"{y}-03-31", v / 4, f"{y}-05-01"), q(f"{y}-04-01", f"{y}-06-30", v / 4, f"{y}-08-01"),
+                q(f"{y}-07-01", f"{y}-09-30", v / 4, f"{y}-11-01"), q(f"{y}-01-01", f"{y}-12-31", v, f"{y + 1}-02-10")]
+    tiny = fu.Fundamentals({"facts": {"us-gaap": {"Revenues": {"units": {"USD": yr(2022, 0.1e6) + yr(2023, 116e6)}}}}})
+    small = fu.Fundamentals({"facts": {"us-gaap": {"Revenues": {"units": {"USD": yr(2022, 36e6) + yr(2023, 72e6)}}}}})
+    d = "20240301"
+    assert tiny.growth(d) == pytest.approx(1159.0)            # 거의 0 → +115,900%
+    assert tiny.growth(d, min_prev=10e6) is None              # 1천만$ 기준에 걸림
+    assert small.growth(d, min_prev=10e6) == pytest.approx(1.0)
+    assert small.growth(d, min_prev=50e6) is None             # 5천만$ 기준이면 CELH 초기 같은 회사도 빠짐
+    assert tiny.growth(d, cap=3.0) == 3.0                     # 상한은 종목을 남기고 값만 자름
+
+
+def test_run_growthfix_ranks_picks(capsys):
+    import random
+    random.seed(9)
+
+    def walk(d):
+        p, cl = 100.0, []
+        for _ in range(600):
+            p *= 1 + d + random.gauss(0, 0.015)
+            cl.append(p)
+        return bars_from(cl)
+    ds = {f"S{i}": walk(0.0004) for i in range(8)}
+    ds["JOBY"], ds["ACHR"] = walk(0.0), walk(0.0)
+
+    class F:
+        def __init__(self, g, prev):
+            self.g, self.prev, self.rev = g, prev, [1]
+
+        def growth(self, y, min_prev=None, cap=None):
+            if min_prev and self.prev < min_prev:
+                return None
+            return min(self.g, cap) if cap is not None else self.g
+    funds = {s: F(0.2 + i * 0.1, 40e6) for i, s in enumerate(ds) if s not in ("JOBY", "ACHR")}
+    funds["JOBY"] = F(1185.0, 0.1e6)
+    groups = [("기본", {k: ds[k] for k in list(ds)[:5]}), ("추가", {k: ds[k] for k in list(ds)[5:]}), ("합계", ds)]
+    analysis.run_growthfix(groups, ds, funds, 1100, {"fee_pct": 0.25, "slip_pct": 0.05}, ["JOBY", "ACHR"])
+    out = capsys.readouterr().out
+    rows = {l.split(":")[0].strip(): l for l in out.splitlines() if "JOBY" in l and "위" in l}
+    assert "JOBY 1위" in rows["매출성장 조건없음"]
+    assert "JOBY 순위 밖" in rows["매출성장 1년전≥1천만$"]          # 거의 0에서 튄 성장은 기준에 걸림
+    assert "JOBY 순위 밖" in rows["+상한300%"]                       # 1천만$ 기준 + 상한 → 기준에서 걸림
+    assert "ACHR 순위 밖" in rows["매출성장 조건없음"]

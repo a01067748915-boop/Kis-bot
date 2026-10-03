@@ -173,9 +173,14 @@ class Fundamentals:
         rev, sh = ttm(self.rev, asof), latest_shares(self.sh, asof)
         return price * sh / rev if rev and rev > 0 and sh and price else None
 
-    def growth(self, asof):
+    def growth(self, asof, min_prev=None, cap=None):
+        """매출 성장률. min_prev: 1년 전 4분기 매출이 이 금액 미만이면 None (거의 0에서 튀는 성장 제외)
+        cap: 성장률 상한 (순위 독차지 방지, 종목은 남김)"""
         now, prev = ttm(self.rev, asof), ttm(self.rev, asof, skip=4)
-        return now / prev - 1 if now is not None and prev and prev > 0 else None
+        if now is None or not prev or prev <= 0 or (min_prev and prev < min_prev):
+            return None
+        g = now / prev - 1
+        return min(g, cap) if cap is not None else g
 
     def roe(self, asof):
         ni, eq = ttm(self.ni, asof), latest(self.eq, asof)

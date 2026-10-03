@@ -235,10 +235,52 @@ def load_funds(datasets, edgar):
     return funds
 
 
-def growth_score(funds):
+GROWTH_MIN_PREV = 10e6  # 매출성장 기본 규칙: 1년 전 4분기 매출 1,000만 달러 이상
+
+
+def growth_score(funds, min_prev=GROWTH_MIN_PREV, cap=None):
     def score(s, y):
-        return funds[s].growth(y) if s in funds else None
+        return funds[s].growth(y, min_prev, cap) if s in funds else None
     return score
+
+
+GROWTH_VARIANTS = [  # (이름, min_prev, cap)
+    ("매출성장 조건없음", None, None), ("매출성장 1년전≥1천만$", 10e6, None),
+    ("+상한300%", 10e6, 3.0), ("매출성장 1년전≥5천만$", 50e6, None),
+]
+
+
+def run_growthfix(groups, raw, funds, budget, opts, picks=()):
+    """매출성장 규칙의 '작은 기반에서 튀는 성장률' 처리 방법 비교"""
+    full = groups[-1][1]
+    start = common_start(full)
+    print(f"\n━━ 매출성장 규칙 기준 비교 — 매달 상위 {SLOTS}종목, {usd(budget)}, 실제 가격으로 1주 단위 ━━")
+    print("  기준: 1년 전 4분기 매출이 기준 미만이면 순위에서 제외 / 상한: 성장률을 +300%로 잘라 순위 계산")
+    for gname, ds in groups:
+        ref = factor_portfolio(ds, momentum_score(ds), budget, start=start, raw=raw, **opts)
+        if not ref["dates"]:
+            continue
+        starts = periods(ref["dates"])
+        base = {s: indicators(b, 200) for s, b in ds.items()}
+        print(f"\n  ■ {gname} ({len(ds)}종목)")
+        print("  " + hold_line(ds, starts, ref["dates"], budget, opts))
+        print("  " + line("모멘텀", run_all(lambda st: factor_portfolio(
+            ds, momentum_score(ds), budget, start=st, ind=base, raw=raw, **opts), starts), budget))
+        for name, mp, cap in GROWTH_VARIANTS:
+            print("  " + line(name, run_all(lambda st, mp=mp, cap=cap: factor_portfolio(
+                ds, growth_score(funds, mp, cap), budget, start=st, ind=base, raw=raw, **opts), starts), budget))
+    if picks:
+        last = max(b[-1]["date"] for b in full.values())
+        print(f"\n  ■ 관심 종목 순위 ({last} 기준, 상위 {SLOTS}위 안이면 그달에 매수)")
+        for name, mp, cap in GROWTH_VARIANTS:
+            sc = {s: funds[s].growth(last, mp, cap) for s in full if s in funds}
+            ranked = [s for s, v in sorted(((s, v) for s, v in sc.items() if v is not None), key=lambda x: -x[1])]
+            marks = []
+            for s in picks:
+                g = funds[s].growth(last) if s in funds else None
+                pos = f"{ranked.index(s) + 1}위/{len(ranked)}" if s in ranked else "순위 밖"
+                marks.append(f"{s} {pos}" + (f" (성장 {g * 100:+,.0f}%)" if g is not None else ""))
+            print(f"    {name:<16}: " + ", ".join(marks) + f" | 1~{SLOTS}위: {', '.join(ranked[:SLOTS])}")
 
 
 def combo_score(names, *scores):
@@ -407,7 +449,7 @@ def main():
     p.add_argument("--targets", default="@universes/growth_balanced.txt")
     p.add_argument("--add", default="@universes/growth_extra.txt", help="함께 쓸 종목 (none=안 씀)")
     p.add_argument("--years", type=int, default=10)
-    p.add_argument("--only", choices=["tech", "fund", "verify", "garp"])
+    p.add_argument("--only", choices=["tech", "fund", "verify", "garp", "growthfix"])
     p.add_argument("--picks", default="@universes/my_picks.txt", help="관심 종목 (garp 에서 따로 점검, none=안 씀)")
     p.add_argument("--fee", type=float, default=None)
     a = p.parse_args()
@@ -419,7 +461,7 @@ def main():
     if a.add and a.add.lower() != "none":
         targets.update(parse_targets(a.add))
     picks = {}
-    if a.only == "garp" and a.picks and a.picks.lower() != "none":
+    if a.only in ("garp", "growthfix") and a.picks and a.picks.lower() != "none":
         picks = parse_targets(a.picks)
         targets.update(picks)
     api = KIS(g("KIS_ENV", "mock"), g("KIS_APP_KEY"), g("KIS_APP_SECRET"), g("KIS_ACCOUNT"), HERE)
@@ -434,7 +476,7 @@ def main():
         datasets[sym] = bars
     budget = float(g("BUDGET_USD", "950"))
     opts = {"fee_pct": a.fee if a.fee is not None else float(g("FEE_PCT", "0.25")), "slip_pct": 0.05}
-    if a.only in ("verify", "garp"):
+    if a.only in ("verify", "garp", "growthfix"):
         from fundamentals import Edgar
         edgar = Edgar(g("SEC_USER_AGENT"))
         raw = {}
@@ -453,6 +495,8 @@ def main():
             groups.append(("합계", datasets))
         if a.only == "garp":
             run_garp(groups, raw, funds, budget, opts, list(picks))
+        elif a.only == "growthfix":
+            run_growthfix(groups, raw, funds, budget, opts, list(picks))
         else:
             run_verify(groups, raw, funds, budget, opts)
         print("\n※ 과거 성과가 미래 수익을 보장하지 않습니다.")
