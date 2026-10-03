@@ -22,6 +22,7 @@ import argparse
 import csv
 import json
 import os
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -49,6 +50,21 @@ def fetch_bars(api, sym, ex, years, adjusted=True, cache=HERE / "data" / "kis"):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"day": today, "bars": bars}))
     return bars
+
+
+def try_fetch(api, sym, ex, years, adjusted=True):
+    """fetch_bars 와 같지만 한투 오류가 계속되면 그 종목만 건너뜀 (전체 실행이 멈추지 않게)"""
+    from kis_api import KISError
+    for attempt in range(2):
+        try:
+            return fetch_bars(api, sym, ex, years, adjusted=adjusted)
+        except KISError as e:
+            if attempt == 0:
+                print(f"  ↻ {sym} 조회 오류, 20초 뒤 다시 시도: {e}")
+                time.sleep(20)
+            else:
+                print(f"  ⚠️ {sym} 조회 실패로 제외: {e}")
+    return []
 
 
 def load_csv(path):

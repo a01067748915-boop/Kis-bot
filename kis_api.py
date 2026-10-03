@@ -29,6 +29,8 @@ TR = {
 
 # 토큰 만료·무효 → 재발급 후 한 번 더 시도
 TOKEN_ERRORS = ("EGW00121", "EGW00123")
+# 잠깐 기다렸다 다시 하면 되는 서버 응답: 호출 한도 초과, 조회 처리 중 일시 오류
+RETRY_CODES = ("EGW00201", "EGW00316")
 
 # 시세용 코드 → 주문/잔고용 코드
 ORDER_EXCH = {"NAS": "NASD", "NYS": "NYSE", "AMS": "AMEX"}
@@ -118,7 +120,7 @@ class KIS:
         self._cached = None
         self.token_file.unlink(missing_ok=True)
 
-    def _request(self, method, path, tr_id, params=None, body=None, retries=3):
+    def _request(self, method, path, tr_id, params=None, body=None, retries=5):
         last, attempt, refreshed = None, 0, False
         while attempt < retries:
             self._throttle()
@@ -149,11 +151,11 @@ class KIS:
                 refreshed = True
                 self._drop_token()
                 continue
-            if msg_cd != "EGW00201":  # 호출 한도 초과만 재시도
+            if msg_cd not in RETRY_CODES:  # 일시 오류만 재시도 (주문은 retries=1 이라 재시도 안 함)
                 break
             attempt += 1
             if attempt < retries:
-                time.sleep(attempt)
+                time.sleep(min(10, 2 * attempt))
         raise KISError(f"{path} 실패: {last}")
 
     # ─── 시세 ─────────────────────────────────────────

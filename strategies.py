@@ -29,7 +29,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from backtest import fetch_bars, load_csv
+from backtest import load_csv, try_fetch
 from signals import breakout_indicators, indicators, market_indicators, rsi
 
 HERE = Path(__file__).resolve().parent
@@ -651,7 +651,7 @@ def main():
         datasets = {}
         for sym, ex in targets.items():
             print(f"{sym} 일봉 수집 중…")
-            datasets[sym] = fetch_bars(api, sym, ex, a.years)
+            datasets[sym] = try_fetch(api, sym, ex, a.years)
             if not datasets[sym]:
                 print(f"  ⚠️ {sym}({ex}) 시세 없음 — 거래소 코드를 확인하세요")
                 datasets.pop(sym)
@@ -662,7 +662,7 @@ def main():
             if sym in datasets:
                 continue
             print(f"{sym} 일봉 수집 중… (추가 종목)")
-            extra[sym] = fetch_bars(api, sym, ex, a.years)
+            extra[sym] = try_fetch(api, sym, ex, a.years)
             if not extra[sym]:
                 print(f"  ⚠️ {sym}({ex}) 시세 없음 — 거래소 코드를 확인하세요 (제외)")
                 extra.pop(sym)
@@ -671,7 +671,7 @@ def main():
         if use_market:
             print(f"{market_name} 일봉 수집 중… (시장 필터용)")
             sym, ex = next(iter(parse_targets(a.market).items()))
-            market_bars = fetch_bars(api, sym, ex, a.years) or None
+            market_bars = try_fetch(api, sym, ex, a.years) or None
 
     print(f"\n수수료 편도 {opts['fee_pct']}%, 슬리피지 {opts['slip_pct']}%")
     stocks = {s: b for s, b in datasets.items() if s != safe}

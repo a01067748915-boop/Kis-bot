@@ -606,3 +606,35 @@ def test_telegram_logs_rejected_send(monkeypatch, caplog):
         tg.send("hi")
     assert "텔레그램 전송 거부 403" in caplog.text and "initiate conversation" in caplog.text
     assert "SECRET:TOKEN" not in caplog.text
+
+
+def test_kis_retries_transient_query_error_but_not_orders(tmp_path, monkeypatch):
+    monkeypatch.setattr(kis_api.time, "sleep", lambda s: None)
+    api = KIS("real", "k", "s", "12345678-01", tmp_path)
+    api._cached = ("t", 9e12)
+    calls = []
+
+    def request(method, url, headers, **k):
+        calls.append(method)
+        if len(calls) < 3:
+            return Resp({"rt_cd": "1", "msg_cd": "EGW00316", "msg1": "조회 처리 중 오류 발생하였습니다."})
+        return Resp({"rt_cd": "0", "output": {"last": "101.5"}, "output2": []})
+
+    monkeypatch.setattr(kis_api.requests, "request", request)
+    assert api.price("QQQM", "NAS") == 101.5 and len(calls) == 3       # 조회는 두 번 실패 후 성공
+    calls.clear()
+    with pytest.raises(KISError):
+        api.limit_order("buy", "QQQM", "NAS", 1, 100.0)                   # 주문은 다시 보내지 않음
+    assert len(calls) == 1
+
+
+def test_try_fetch_skips_symbol_after_repeated_errors(monkeypatch, capsys):
+    import backtest
+    monkeypatch.setattr(backtest.time, "sleep", lambda s: None)
+
+    class A:
+        def daily_history(self, *a, **k):
+            raise KISError("EGW00316 조회 처리 중 오류")
+    assert backtest.try_fetch(A(), "ZZZ", "NAS", 1) == []
+    out = capsys.readouterr().out
+    assert "다시 시도" in out and "ZZZ 조회 실패로 제외" in out

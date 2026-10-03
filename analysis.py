@@ -25,7 +25,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from backtest import fetch_bars
+from backtest import try_fetch
 from signals import bollinger_indicators, ichimoku_indicators, indicators, macd_indicators
 from strategies import (breakout_portfolio, common_start, hold_curve, portfolio, slot_engine,
                         summary, usd, warn_jumps)
@@ -468,7 +468,7 @@ def main():
     datasets = {}
     for sym, ex in targets.items():
         print(f"{sym} 일봉 수집 중…")
-        bars = fetch_bars(api, sym, ex, a.years)
+        bars = try_fetch(api, sym, ex, a.years)
         if not bars:
             print(f"  ⚠️ {sym}({ex}) 시세 없음 — 거래소 코드를 확인하세요 (제외)")
             continue
@@ -483,7 +483,7 @@ def main():
         for sym, ex in targets.items():
             if sym in datasets:
                 print(f"{sym} 실제 가격(분할 미반영) 수집 중…")
-                raw[sym] = fetch_bars(api, sym, ex, a.years, adjusted=False)
+                raw[sym] = try_fetch(api, sym, ex, a.years, adjusted=False)
         print("SEC 재무제표 확인 중…")
         funds = load_funds(datasets, edgar)
         base_syms = set(parse_targets(a.targets))
