@@ -275,7 +275,7 @@ def slot_engine(datasets, ind, budget, slots, wants_exit, candidates, fee_pct=0.
                 last[s] = px[s][d]["close"]
         curve.append(cash + sum(p["qty"] * last[s] for s, p in pos.items()))
     n = max(1, len(dates))
-    return {"dates": dates, "curve": curve, "trades": trades, "used": used / n / slots, "open": len(pos),
+    return {"dates": dates, "curve": curve, "trades": trades, "used": used / n / slots, "open": len(pos), "open_syms": list(pos),
             "skipped": skipped - {t[2] for t in trades}, "skips": skips}
 
 

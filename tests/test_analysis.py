@@ -179,3 +179,56 @@ def test_run_verify_smoke(capsys):
     out = capsys.readouterr().out
     assert "① 종목 묶음별" in out and "② 설정값" in out and "③ 실제 가격 반영 효과" in out
     assert "모멘텀+매출성장" in out and "12개월" in out
+
+
+def test_psr_uses_shares_summed_per_filing_and_point_in_time():
+    rev = [q(f"2023-{m:02d}-01", f"2023-{m + 2:02d}-28", 100e6, f"2023-{m + 3:02d}-15") for m in (1, 4, 7)]
+    rev += [q("2023-01-01", "2023-12-31", 400e6, "2024-02-10")]
+    facts = {"facts": {"us-gaap": {"Revenues": {"units": {"USD": rev}}},
+                       "dei": {"EntityCommonStockSharesOutstanding": {"units": {"shares": [
+                           {"end": "2024-01-31", "val": 6e6, "filed": "2024-02-10", "accn": "x1"},   # A주
+                           {"end": "2024-01-31", "val": 4e6, "filed": "2024-02-10", "accn": "x1"},   # C주
+                           {"end": "2023-04-30", "val": 1e6, "filed": "2023-05-10", "accn": "x0"}]}}}}}
+    f = fu.Fundamentals(facts)
+    assert f.revenue("20240301") == pytest.approx(400e6)
+    assert f.psr("20240301", 20.0) == pytest.approx(20 * 10e6 / 400e6)     # 같은 공시의 A·C 합산
+    assert f.psr("20231201", 20.0) is None                                  # 4분기 매출 아직 없음
+
+
+def test_garp_rules_and_picks_check(capsys):
+    import random
+    random.seed(7)
+
+    def walk(drift):
+        p, cl = 100.0, []
+        for _ in range(520):
+            p *= 1 + drift + random.gauss(0, 0.015)
+            cl.append(p)
+        return bars_from(cl)
+    ds = {f"S{i}": walk(random.gauss(0.0004, 0.001)) for i in range(8)}
+    ds["JOBY"] = walk(0.0)
+
+    class F:
+        def __init__(self, g, rev):
+            self.g, self.rev_, self.rev = g, rev, [1]
+
+        def growth(self, y):
+            return self.g
+
+        def revenue(self, y):
+            return self.rev_
+
+        def psr(self, y, price):
+            return 5.0
+    funds = {s: F(0.1 + i * 0.05, 200e6) for i, s in enumerate(ds) if s != "JOBY"}
+    funds["JOBY"] = F(9.0, 1e6)                    # 매출 100만 달러 — 성장률이 튀어도 제외돼야 함
+    a, b, c = analysis.garp_scores(ds, funds, ds)
+    y = ds["S0"][300]["date"]
+    assert a("JOBY", y) is None and b("JOBY", y) is None
+    assert b("S7", y) > b("S1", y)                 # 같은 PSR 이면 성장률 높은 쪽
+    assert a("S0", y) is None                      # 성장 하위 절반은 A 대상 아님
+    groups = [("A", {k: ds[k] for k in list(ds)[:4]}), ("B", {k: ds[k] for k in list(ds)[4:]}), ("합계", ds)]
+    analysis.run_garp(groups, ds, funds, 1100, {"fee_pct": 0.25, "slip_pct": 0.05}, ["JOBY", "ACHR"])
+    out = capsys.readouterr().out
+    assert "A 덜오른고성장" in out and "관심 종목 점검" in out
+    assert "JOBY: 데이터" in out and "A·B·C 에서 제외" in out and "ACHR: 시세 없음" in out

@@ -27,6 +27,7 @@ REVENUE_TAGS = ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues
                 "RevenueFromContractWithCustomerIncludingAssessedTax", "SalesRevenueGoodsNet"]
 NET_INCOME_TAGS = ["NetIncomeLoss", "ProfitLoss"]
 EQUITY_TAGS = ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"]
+SHARE_TAGS = ["CommonStockSharesOutstanding"]  # dei:EntityCommonStockSharesOutstanding 이 없을 때
 
 
 class Edgar:
@@ -76,9 +77,9 @@ def _ymd(s):
     return s.replace("-", "")
 
 
-def entries(facts, tags, unit="USD"):
+def entries(facts, tags, unit="USD", ns="us-gaap"):
     """여러 항목 이름의 수치를 합침. 같은 기간(start,end)은 앞쪽 항목 우선"""
-    gaap = (facts or {}).get("facts", {}).get("us-gaap", {})
+    gaap = (facts or {}).get("facts", {}).get(ns, {})
     seen, out = set(), []
     for tag in tags:
         for e in gaap.get(tag, {}).get("units", {}).get(unit, []):
@@ -135,6 +136,25 @@ def latest(items, asof):
     return max(known)[2] if known else None
 
 
+def share_entries(facts):
+    """발행주식 수 (표지의 dei 값 우선). 주식 종류가 여러 개면(GOOGL A·B·C) 같은 공시의 값을 합침"""
+    dei = (facts or {}).get("facts", {}).get("dei", {}).get("EntityCommonStockSharesOutstanding", {})
+    items = dei.get("units", {}).get("shares", []) or entries(facts, SHARE_TAGS, unit="shares")
+    merged = {}
+    for e in items:
+        if "filed" not in e:
+            continue
+        key = (e.get("accn", e["filed"]), e["end"])
+        m = merged.setdefault(key, {"end": e["end"], "filed": e["filed"], "val": 0.0})
+        m["val"] += float(e["val"])
+    return list(merged.values())
+
+
+def latest_shares(items, asof):
+    known = [(_ymd(e["filed"]), _ymd(e["end"]), e["val"]) for e in items if _ymd(e["filed"]) <= asof]
+    return max(known)[2] if known else None
+
+
 class Fundamentals:
     """종목별 분기 수치를 미리 정리해 두고, 날짜별 지표를 계산"""
 
@@ -142,6 +162,16 @@ class Fundamentals:
         self.rev = quarterly(entries(facts, REVENUE_TAGS))
         self.ni = quarterly(entries(facts, NET_INCOME_TAGS))
         self.eq = entries(facts, EQUITY_TAGS)
+        self.sh = share_entries(facts)
+
+    def revenue(self, asof):
+        """최근 4분기 매출 합"""
+        return ttm(self.rev, asof)
+
+    def psr(self, asof, price):
+        """주가매출비율 = 시가총액(그날 실제 주가 × 발행주식 수) ÷ 최근 4분기 매출"""
+        rev, sh = ttm(self.rev, asof), latest_shares(self.sh, asof)
+        return price * sh / rev if rev and rev > 0 and sh and price else None
 
     def growth(self, asof):
         now, prev = ttm(self.rev, asof), ttm(self.rev, asof, skip=4)

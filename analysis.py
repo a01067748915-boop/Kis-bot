@@ -251,6 +251,101 @@ def combo_score(names, *scores):
     return score
 
 
+MIN_REV = 50e6  # GARP 규칙: 최근 4분기 매출 5,000만 달러 미만(상용화 전 등)은 성장률이 튀어 제외
+
+
+def garp_scores(ds, funds, raw):
+    """A 덜 오른 고성장주 / B 성장 대비 싼 주식(성장률÷PSR) / C 고점 대비 빠진 고성장주 — 날짜별 캐시"""
+    closes = {s: [b["close"] for b in bs] for s, bs in ds.items()}
+    pos = {s: {b["date"]: i for i, b in enumerate(bs)} for s, bs in ds.items()}
+    rawpx = {s: {b["date"]: b for b in bs} for s, bs in raw.items()}
+    cache = {}
+
+    def table(y):
+        if y in cache:
+            return cache[y]
+        rows = {}
+        for s in ds:
+            f, i = funds.get(s), pos[s].get(y)
+            if not f or i is None or i < 252:
+                continue
+            rev, g = f.revenue(y), f.growth(y)
+            if rev is None or rev < MIN_REV or g is None:
+                continue
+            c = closes[s]
+            rp = rawpx.get(s, {}).get(y)
+            rows[s] = {"g": g, "ret6": c[i] / c[i - 126] - 1, "dd": 1 - c[i] / max(c[i - 251:i + 1]),
+                       "psr": f.psr(y, rp["close"]) if rp else None}
+        if rows:
+            gs = sorted(r["g"] for r in rows.values())
+            med = gs[len(gs) // 2]
+            for r in rows.values():
+                r["top"] = r["g"] >= med
+        cache[y] = rows
+        return rows
+
+    def a(s, y):
+        r = table(y).get(s)
+        return -r["ret6"] if r and r["top"] else None
+
+    def b(s, y):
+        r = table(y).get(s)
+        return r["g"] / r["psr"] if r and r["g"] > 0 and r["psr"] and r["psr"] > 0 else None
+
+    def c(s, y):
+        r = table(y).get(s)
+        return r["dd"] if r and r["top"] else None
+    return a, b, c
+
+
+def run_garp(groups, raw, funds, budget, opts, picks=()):
+    full = groups[-1][1]
+    start = common_start(full)
+    print(f"\n━━ 덜 오른 성장주(GARP) 규칙 비교 — 매달 상위 {SLOTS}종목, {usd(budget)}, 실제 가격으로 1주 단위 ━━")
+    print("  A 덜오른고성장: 매출성장 상위 절반 중 6개월 상승률 가장 낮은 순")
+    print("  B 성장÷PSR    : 매출성장률 ÷ 주가매출비율 높은 순 (성장 대비 싼 주식)")
+    print("  C 고점대비하락: 매출성장 상위 절반 중 52주 고점 대비 많이 빠진 순")
+    print(f"  ※ A·B·C 는 최근 4분기 매출 {MIN_REV / 1e6:.0f}백만 달러 이상만 (매출이 거의 없으면 성장률이 튐)")
+    picked = {}
+    for gname, ds in groups:
+        ref = factor_portfolio(ds, momentum_score(ds), budget, start=start, raw=raw, **opts)
+        if not ref["dates"]:
+            continue
+        starts = periods(ref["dates"])
+        base = {s: indicators(b, 200) for s, b in ds.items()}
+        a, b, c = garp_scores(ds, funds, raw)
+        print(f"\n  ■ {gname} ({len(ds)}종목)")
+        print("  " + hold_line(ds, starts, ref["dates"], budget, opts))
+        for name, sc in [("매출성장", growth_score(funds)), ("모멘텀", momentum_score(ds)),
+                         ("A 덜오른고성장", a), ("B 성장÷PSR", b), ("C 고점대비하락", c)]:
+            runs = run_all(lambda st, sc=sc: factor_portfolio(ds, sc, budget, start=st, ind=base, raw=raw, **opts),
+                           starts)
+            print("  " + line(name, runs, budget))
+            if ds is full:
+                r = runs[0][1]
+                picked[name] = {t[2] for t in r["trades"]} | set(r.get("open_syms", []))
+    if picks:
+        print("\n  ■ 관심 종목 점검 (가장 최근 기준)")
+        for s in picks:
+            if s not in full:
+                print(f"    {s}: 시세 없음 — 거래소 코드 확인")
+                continue
+            last = full[s][-1]["date"]
+            f = funds.get(s)
+            rev = f.revenue(last) if f else None
+            g = f.growth(last) if f else None
+            rp = raw.get(s, [{}])[-1].get("close") if raw.get(s) else None
+            psr = f.psr(last, rp) if f and rp else None
+            chosen = [n for n, syms in picked.items() if s in syms]
+            info = (f"데이터 {full[s][0]['date']}~, 최근 4분기 매출 "
+                    + (f"{rev / 1e6:,.1f}백만 달러" if rev is not None else "없음")
+                    + (f", 매출성장 {g * 100:+.0f}%" if g is not None else "")
+                    + (f", PSR {psr:,.0f}배" if psr else ""))
+            why = "" if (rev or 0) >= MIN_REV else f" → 매출 {MIN_REV / 1e6:.0f}백만 달러 미만이라 A·B·C 에서 제외"
+            print(f"    {s}: {info}{why}")
+            print(f"      과거에 고른 규칙: {', '.join(chosen) if chosen else '없음'}")
+
+
 def cell(r, budget):
     sm = summary([v / budget for v in r["curve"]])
     return f"연{sm['연']:+.0f}/{sm['낙폭']:.0f}"
@@ -312,7 +407,8 @@ def main():
     p.add_argument("--targets", default="@universes/growth_balanced.txt")
     p.add_argument("--add", default="@universes/growth_extra.txt", help="함께 쓸 종목 (none=안 씀)")
     p.add_argument("--years", type=int, default=10)
-    p.add_argument("--only", choices=["tech", "fund", "verify"])
+    p.add_argument("--only", choices=["tech", "fund", "verify", "garp"])
+    p.add_argument("--picks", default="@universes/my_picks.txt", help="관심 종목 (garp 에서 따로 점검, none=안 씀)")
     p.add_argument("--fee", type=float, default=None)
     a = p.parse_args()
 
@@ -322,6 +418,10 @@ def main():
     targets = parse_targets(a.targets)
     if a.add and a.add.lower() != "none":
         targets.update(parse_targets(a.add))
+    picks = {}
+    if a.only == "garp" and a.picks and a.picks.lower() != "none":
+        picks = parse_targets(a.picks)
+        targets.update(picks)
     api = KIS(g("KIS_ENV", "mock"), g("KIS_APP_KEY"), g("KIS_APP_SECRET"), g("KIS_ACCOUNT"), HERE)
     datasets = {}
     for sym, ex in targets.items():
@@ -334,7 +434,7 @@ def main():
         datasets[sym] = bars
     budget = float(g("BUDGET_USD", "950"))
     opts = {"fee_pct": a.fee if a.fee is not None else float(g("FEE_PCT", "0.25")), "slip_pct": 0.05}
-    if a.only == "verify":
+    if a.only in ("verify", "garp"):
         from fundamentals import Edgar
         edgar = Edgar(g("SEC_USER_AGENT"))
         raw = {}
@@ -348,9 +448,13 @@ def main():
         add_syms = set(targets) - base_syms
         groups = [(f"기본 목록({a.targets})", {s: b for s, b in datasets.items() if s in base_syms})]
         if add_syms:
-            groups.append((f"추가 목록({a.add})", {s: b for s, b in datasets.items() if s in add_syms}))
+            groups.append((f"추가 목록({a.add}{' + 관심 종목' if picks else ''})",
+                           {s: b for s, b in datasets.items() if s in add_syms}))
             groups.append(("합계", datasets))
-        run_verify(groups, raw, funds, budget, opts)
+        if a.only == "garp":
+            run_garp(groups, raw, funds, budget, opts, list(picks))
+        else:
+            run_verify(groups, raw, funds, budget, opts)
         print("\n※ 과거 성과가 미래 수익을 보장하지 않습니다.")
         return
     start = common_start(datasets)
