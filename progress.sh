@@ -38,7 +38,8 @@ if [ -n "$TRIAL" ]; then
 elif grep -q "견고성 검증" "$LOG"; then
   echo "3/4단계 큰 승자 빼기 계산 중 — 다음 단계(무작위 검증)로 넘어가면 횟수가 표시됨"
 elif grep -q "SEC 재무제표" "$LOG"; then
-  echo "2/4단계 SEC 재무제표 받는 중 (종목당 1~2초, 받은 자료는 7일간 재사용)"
+  SEC=$(grep -oE 'SEC [0-9]+/[0-9]+종목' "$LOG" | tail -1)
+  echo "2/4단계 SEC 재무제표 받는 중 ${SEC:+— ${SEC#SEC }} (25종목마다 표시, 받은 자료는 7일간 재사용)"
 elif [ "$RAW" -gt 0 ]; then
   echo "1/4단계 시세 받기 — 실제 가격: ${RAW}/${TOTAL}종목 (수정주가는 끝)"
   eta "$((ADJ + RAW))" "$((TOTAL * 2))"

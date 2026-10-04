@@ -222,11 +222,14 @@ def run_fund(datasets, edgar, budget, opts, start, starts=None, dates=None):
 # ─── 검증: 모멘텀 · 매출성장 상위 N ─────────────────
 def load_funds(datasets, edgar):
     from fundamentals import Fundamentals
+    import requests
     funds = {}
-    for s in datasets:
+    for i, s in enumerate(datasets, 1):
+        if i % 25 == 0:
+            print(f"  … SEC {i}/{len(datasets)}종목")
         try:
             f = edgar.facts(s)
-        except RuntimeError as e:
+        except (RuntimeError, ValueError, requests.RequestException) as e:  # 한 종목 실패로 전체가 멈추지 않게
             print(f"  ⚠️ {s} 재무 받기 실패: {e}")
             continue
         fu = Fundamentals(f) if f else None
