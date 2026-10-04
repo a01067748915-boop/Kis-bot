@@ -234,7 +234,7 @@ def slot_engine(datasets, ind, budget, slots, wants_exit, candidates, fee_pct=0.
         start = next((d for d in cal[1:] if all(ready(s, d) for s in px)), None)
     dates = [d for d in cal[1:] if start and d >= start and (date_ok is None or date_ok(prev_of[d]))]
     cash, pos, curve, trades, used, last, skipped, skips = budget, {}, [], [], 0, {}, set(), 0
-    rawpx = {s: by_date(b) for s, b in raw.items()} if raw else None
+    rawpx = {s: by_date(raw[s]) for s in datasets if s in raw} if raw else None  # 이번에 쓰는 종목만
     for d in dates:
         y = prev_of[d]
         # 1) 매도 (거래정지 등 시세 없는 날은 보류)

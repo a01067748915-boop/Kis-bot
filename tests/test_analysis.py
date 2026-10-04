@@ -152,6 +152,20 @@ def test_fetch_bars_cache(tmp_path):
     assert fetch_bars(a, "X", "NAS", 1, adjusted=False, cache=tmp_path)[0]["close"] == 10.0
     fetch_bars(a, "X", "NAS", 1, cache=tmp_path)
     assert A.calls == 2                                              # 같은 날 다시 부르면 저장분 사용
+    import json
+    path = tmp_path / "X_NAS_adj_1y.json"
+    path.write_text(json.dumps({"day": "20000101", "bars": []}))
+    fetch_bars(a, "X", "NAS", 1, cache=tmp_path)
+    assert A.calls == 3                                              # 오래된 저장분은 다시 받음
+
+
+def test_compact_bar_reads_like_dict():
+    from backtest import compact
+    b = compact([{"date": "20260102", "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5}])[0]
+    assert (b["date"], b["open"], b["close"]) == ("20260102", 1.0, 1.5)
+    assert b.get("volume") is None and b.get("volume", 0) == 0 and "volume" not in b and "close" in b
+    r = compact([{"date": "20260102", "open": 9.0, "close": 9.5}], keys=("open",))[0]
+    assert r["open"] == 9.0 and r.get("close") is None
 
 
 def test_run_verify_smoke(capsys):
@@ -300,6 +314,8 @@ def test_run_stress_smoke(capsys):
         def growth(self, y, min_prev=None, cap=None):
             return self.g + (int(y[4:6]) % 3) * 0.3   # 달마다 순위가 바뀌게
     funds = {s: F(random.random()) for s in full}
+    from backtest import compact
+    full = {s: compact(b) for s, b in full.items()}                # 실제 실행처럼 메모리 절약형 일봉으로
     analysis.run_stress(full, full, funds, 1100, {"fee_pct": 0.25, "slip_pct": 0.05}, trials=4, size=8)
     out = capsys.readouterr().out
     assert "① 큰 승자 빼기" in out and "상위 10 제외" in out and "가장 많이 번 5종목 제외" in out

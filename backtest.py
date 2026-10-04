@@ -31,16 +31,44 @@ from dotenv import load_dotenv
 HERE = Path(__file__).resolve().parent
 
 
-def fetch_bars(api, sym, ex, years, adjusted=True, cache=HERE / "data" / "kis"):
+class Bar(tuple):
+    """메모리를 덜 쓰는 일봉 한 개 (dict 의 약 1/5) — b["close"], b.get("volume") 처럼 dict 와 똑같이 읽음"""
+    __slots__ = ()
+    KEYS = ("date", "open", "high", "low", "close", "volume")
+    _IDX = {k: i for i, k in enumerate(KEYS)}
+
+    def __getitem__(self, k):
+        return tuple.__getitem__(self, self._IDX[k] if isinstance(k, str) else k)
+
+    def get(self, k, default=None):
+        i = self._IDX.get(k)
+        v = tuple.__getitem__(self, i) if i is not None else None
+        return default if v is None else v
+
+    def __contains__(self, k):
+        return k in self._IDX and self.get(k) is not None
+
+
+def compact(bars, keys=Bar.KEYS[1:]):
+    """일봉 목록을 Bar 로 바꿔 메모리 절약 (종목 수백 개를 한 번에 분석할 때). 날짜 문자열은 종목끼리 공유
+    keys: 남길 항목 (나머지는 None — 실제 가격 일봉은 시가·종가만 쓰므로 keys=("open", "close"))"""
+    import sys
+    return [Bar((sys.intern(b["date"]),) + tuple(b.get(k) if k in keys else None for k in Bar.KEYS[1:]))
+            for b in bars]
+
+
+def fetch_bars(api, sym, ex, years, adjusted=True, cache=HERE / "data" / "kis", max_age_days=3):
     """KIS 미국 일봉 최근 years년 (100일 단위로 이어 붙이며 분할 기준 차이 보정)
-    adjusted=False 면 그날 실제 가격(분할 미반영). 받은 결과는 그날 하루 동안 저장해 다시 실행할 때 재사용"""
+    adjusted=False 면 그날 실제 가격(분할 미반영). 받은 결과는 max_age_days 일 동안 저장해 다시 실행할 때 재사용
+    (중간에 끊겨 다시 돌려도 이미 받은 종목은 건너뜀)"""
     limit = (datetime.now() - timedelta(days=365 * years)).strftime("%Y%m%d")
     path = Path(cache) / f"{sym}_{ex}_{'adj' if adjusted else 'raw'}_{years}y.json" if cache else None
     today = datetime.now().strftime("%Y%m%d")
     if path and path.exists():
         try:
             saved = json.loads(path.read_text())
-            if saved.get("day") == today:
+            oldest = (datetime.now() - timedelta(days=max_age_days - 1)).strftime("%Y%m%d")
+            if oldest <= saved.get("day", "") <= today:
                 return saved["bars"]
         except (ValueError, KeyError):
             pass

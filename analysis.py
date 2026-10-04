@@ -25,7 +25,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from backtest import try_fetch
+from backtest import compact, try_fetch
 from signals import bollinger_indicators, ichimoku_indicators, indicators, macd_indicators
 from strategies import (breakout_portfolio, common_start, hold_curve, portfolio, slot_engine,
                         summary, usd, warn_jumps)
@@ -560,7 +560,7 @@ def main():
             print(f"  ⚠️ {sym}({ex}) 시세 없음 — 거래소 코드를 확인하세요 (제외)")
             continue
         warn_jumps(sym, bars)
-        datasets[sym] = bars
+        datasets[sym] = compact(bars)
     budget = float(g("BUDGET_USD", "950"))
     opts = {"fee_pct": a.fee if a.fee is not None else float(g("FEE_PCT", "0.25")), "slip_pct": 0.05}
     if a.only in ("verify", "garp", "growthfix", "stress"):
@@ -570,7 +570,7 @@ def main():
         for sym, ex in targets.items():
             if sym in datasets:
                 print(f"{sym} 실제 가격(분할 미반영) 수집 중…")
-                raw[sym] = try_fetch(api, sym, ex, a.years, adjusted=False)
+                raw[sym] = compact(try_fetch(api, sym, ex, a.years, adjusted=False), keys=("open", "close"))
         print("SEC 재무제표 확인 중…")
         funds = load_funds(datasets, edgar)
         base_syms = set(parse_targets(a.targets))
