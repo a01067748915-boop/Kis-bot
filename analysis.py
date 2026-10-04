@@ -26,7 +26,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from backtest import compact, try_fetch
-from signals import bollinger_indicators, ichimoku_indicators, indicators, macd_indicators
+from signals import bollinger_indicators, ichimoku_indicators, indicators, macd_indicators, market_indicators
 from strategies import (breakout_portfolio, common_start, hold_curve, portfolio, slot_engine,
                         summary, usd, warn_jumps)
 
@@ -49,8 +49,10 @@ def signal_portfolio(datasets, ind_fn, budget, slots=SLOTS, need_trend=True, sta
     return slot_engine(datasets, ind, budget, slots, wants_exit, candidates, start=start, **opts)
 
 
-def factor_portfolio(datasets, score, budget, slots=SLOTS, need_trend=False, start=None, ind=None, raw=None, **opts):
-    """매달 첫 거래일 score(종목, 전날) 높은 순 상위 slots 개로 교체. score 가 None 이면 제외"""
+def factor_portfolio(datasets, score, budget, slots=SLOTS, need_trend=False, start=None, ind=None, raw=None,
+                     market_ok=None, **opts):
+    """매달 첫 거래일 score(종목, 전날) 높은 순 상위 slots 개로 교체. score 가 None 이면 제외
+    market_ok(전날) 이 False 면 그달은 전부 팔고 현금 (시장 필터)"""
     ind = ind or {s: indicators(b, 200) for s, b in datasets.items()}
     state = {"month": None, "target": []}
 
@@ -58,6 +60,9 @@ def factor_portfolio(datasets, score, budget, slots=SLOTS, need_trend=False, sta
         if y[:6] == state["month"]:
             return
         state["month"] = y[:6]
+        if market_ok is not None and not market_ok(y):
+            state["target"] = []
+            return
         ranked = []
         for s in ind:
             if y not in ind[s] or (need_trend and not ind[s][y]["trend"]):
@@ -78,7 +83,8 @@ def factor_portfolio(datasets, score, budget, slots=SLOTS, need_trend=False, sta
     return slot_engine(datasets, ind, budget, slots, wants_exit, candidates, start=start, raw=raw, **opts)
 
 
-def momentum_score(datasets, n=126):
+def momentum_score(datasets, n=126, skip=0):
+    """최근 n거래일 수익률. skip: 최근 skip일은 빼고 계산 (12-1개월 모멘텀 = n 252, skip 21 — 단기 되돌림 회피)"""
     closes = {s: [(b["date"], b["close"]) for b in bs] for s, bs in datasets.items()}
     pos = {s: {d: i for i, (d, _) in enumerate(c)} for s, c in closes.items()}
 
@@ -86,7 +92,7 @@ def momentum_score(datasets, n=126):
         i = pos[s].get(y)
         if i is None or i < n:
             return None
-        return closes[s][i][1] / closes[s][i - n][1] - 1
+        return closes[s][i - skip][1] / closes[s][i - n][1] - 1
     return score
 
 
@@ -476,6 +482,78 @@ def run_stress(full, raw, funds, budget, opts, trials=200, size=40, seed=1):
     print("  → '보유보다 높은 경우'가 80% 이상이고 하위10%도 0 근처면, 특정 종목 구성에 기대지 않는 전략")
 
 
+MOM_VARIANTS = [  # (이름, 칸 수, 기간, 최근 제외일, 시장 필터)
+    ("6개월·상위4(기존)", 4, 126, 0, False),
+    ("12-1개월·상위4", 4, 252, 21, False),
+    ("6개월·상위10", 10, 126, 0, False),
+    ("6개월·상위20", 20, 126, 0, False),
+    ("6개월·상위4+시장", 4, 126, 0, True),
+    ("12-1·상위10+시장", 10, 252, 21, True),
+]
+
+
+def run_momvar(full, raw, budget, opts, market, trials=200, size=40, seed=1, big=5000.0):
+    """모멘텀 변형 비교 — 넓게 분산(10·20칸) / 12-1개월 / 시장 필터(SPY 200일선 아래면 현금)
+    market: {날짜: SPY 가 200일선 위인지}"""
+    import random
+    start = common_start(full)
+    base_ind = {s: indicators(b, 200) for s, b in full.items()}
+    mok = (lambda y: market.get(y, True)) if market else None
+
+    def strat(ds, v, bud=budget):
+        _, slots, n, skip, filt = v
+        sc = momentum_score(ds, n, skip)
+        sub = {s: base_ind[s] for s in ds}
+        return lambda st: factor_portfolio(ds, sc, bud, slots=slots, start=st, ind=sub, raw=raw,
+                                           market_ok=mok if filt else None, **opts)
+
+    variants = [v for v in MOM_VARIANTS if market or not v[4]]
+    ref = strat(full, variants[0])(start)
+    dates = ref["dates"]
+    if not dates:
+        print("  데이터 부족")
+        return
+    starts = periods(dates)
+    print(f"\n━━ 모멘텀 변형 비교 ({len(full)}종목, 매달 교체, {usd(budget)}, 실제 가격) ━━")
+    if not market:
+        print("  ⚠️ SPY 시세가 없어 시장 필터 변형은 생략")
+    print("\n① 전체 종목")
+    print("  " + hold_line(full, starts, dates, budget, opts))
+    for v in variants:
+        r = run_all(strat(full, v), starts)
+        print("  " + line(v[0], r, budget) + f" | 1주 못 사 건너뜀 {r[0][1]['skips']}회")
+    v20 = next(v for v in variants if v[1] == 20)
+    print(f"  (참고) {v20[0]}을 {usd(big)}로: "
+          + line("", run_all(strat(full, v20, big), starts), big).split("| ", 1)[1])
+    print("  → 칸이 많으면 칸당 금액이 작아 비싼 종목은 1주도 못 삼 (건너뜀 횟수 참고)")
+
+    rng = random.Random(seed)
+    pool = sorted(full)
+    size = min(size, len(pool))
+    print(f"\n② 무작위 {size}종목 × {trials}회 (전체 기간, seed={seed})")
+    res = {v[0]: {"ex": [], "mdd": []} for v in variants}
+    hold_mdd = []
+    for t in range(trials):
+        ds = {s: full[s] for s in rng.sample(pool, size)}
+        hc, _ = hold_curve(ds, dates, budget, **opts)
+        hs = summary([x / budget for x in hc])
+        hold_mdd.append(hs["낙폭"])
+        for v in variants:
+            sm = summary([x / budget for x in strat(ds, v)(start)["curve"]])
+            res[v[0]]["ex"].append(sm["연"] - hs["연"])
+            res[v[0]]["mdd"].append(sm["낙폭"])
+        if (t + 1) % 25 == 0:
+            print(f"    … {t + 1}/{trials}회")
+    print(f"  균등 보유 최대낙폭 중앙값 {_pct(hold_mdd, 0.5):.0f}%")
+    for v in variants:
+        ex = res[v[0]]["ex"]
+        win = sum(x > 0 for x in ex) / len(ex) * 100
+        print(f"  {v[0]:<14}: 보유보다 높은 경우 {win:3.0f}% | 연수익 차이 중앙값 {_pct(ex, 0.5):+.0f}%p"
+              f" (하위10% {_pct(ex, 0.1):+.0f}%p ~ 상위10% {_pct(ex, 0.9):+.0f}%p)"
+              f" | 최대낙폭 중앙값 {_pct(res[v[0]]['mdd'], 0.5):.0f}%")
+    print("  → '보유보다 높은 경우' 80% 이상 + 하위10% 0 근처면 견고. 낙폭이 보유보다 작으면 위험 대비 개선")
+
+
 def cell(r, budget):
     sm = summary([v / budget for v in r["curve"]])
     return f"연{sm['연']:+.0f}/{sm['낙폭']:.0f}"
@@ -537,7 +615,7 @@ def main():
     p.add_argument("--targets", default="@universes/growth_balanced.txt")
     p.add_argument("--add", default="@universes/growth_extra.txt", help="함께 쓸 종목 (none=안 씀)")
     p.add_argument("--years", type=int, default=10)
-    p.add_argument("--only", choices=["tech", "fund", "verify", "garp", "growthfix", "stress"])
+    p.add_argument("--only", choices=["tech", "fund", "verify", "garp", "growthfix", "stress", "momvar"])
     p.add_argument("--trials", type=int, default=200, help="stress: 무작위 묶음 반복 횟수")
     p.add_argument("--size", type=int, default=40, help="stress: 무작위 묶음 종목 수")
     p.add_argument("--picks", default="@universes/my_picks.txt", help="관심 종목 (garp 에서 따로 점검, none=안 씀)")
@@ -566,14 +644,21 @@ def main():
         datasets[sym] = compact(bars)
     budget = float(g("BUDGET_USD", "950"))
     opts = {"fee_pct": a.fee if a.fee is not None else float(g("FEE_PCT", "0.25")), "slip_pct": 0.05}
-    if a.only in ("verify", "garp", "growthfix", "stress"):
-        from fundamentals import Edgar
-        edgar = Edgar(g("SEC_USER_AGENT"))
+    if a.only in ("verify", "garp", "growthfix", "stress", "momvar"):
         raw = {}
         for sym, ex in targets.items():
             if sym in datasets:
                 print(f"{sym} 실제 가격(분할 미반영) 수집 중…")
                 raw[sym] = compact(try_fetch(api, sym, ex, a.years, adjusted=False), keys=("open", "close"))
+        if a.only == "momvar":
+            print("SPY(시장 필터) 일봉 수집 중…")
+            spy = try_fetch(api, "SPY", "AMS", a.years)
+            market = {d: v["trend"] for d, v in market_indicators(spy).items()} if spy else {}
+            run_momvar(datasets, raw, budget, opts, market, a.trials, a.size)
+            print("\n※ 과거 성과가 미래 수익을 보장하지 않습니다.")
+            return
+        from fundamentals import Edgar
+        edgar = Edgar(g("SEC_USER_AGENT"))
         print("SEC 재무제표 확인 중…")
         funds = load_funds(datasets, edgar)
         base_syms = set(parse_targets(a.targets))

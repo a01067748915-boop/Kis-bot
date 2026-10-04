@@ -33,10 +33,10 @@ eta() {  # eta 완료수 전체수 → 지금까지 속도로 남은 시간
 echo "⏱  실행 시간: $(hm "$ELAPSED")   (메모리 $(ps -o rss= -p "$PID" | awk '{printf "%d", $1/1024}')MB 사용 중)"
 if [ -n "$TRIAL" ]; then
   DONE=${TRIAL%%/*}; ALL=${TRIAL#*/}; ALL=${ALL%회}
-  echo "4/4단계 무작위 묶음 검증: ${DONE}/${ALL}회 (50회마다 표시)"
+  echo "4/4단계 무작위 묶음 검증: ${DONE}/${ALL}회 (25~50회마다 표시)"
   echo "   (이 단계는 남은 시간 계산 불가 — 횟수가 늘어나는 간격으로 가늠하세요)"
-elif grep -q "견고성 검증" "$LOG"; then
-  echo "3/4단계 큰 승자 빼기 계산 중 — 다음 단계(무작위 검증)로 넘어가면 횟수가 표시됨"
+elif grep -qE "견고성 검증|모멘텀 변형 비교" "$LOG"; then
+  echo "3/4단계 전체 종목 계산 중 — 다음 단계(무작위 검증)로 넘어가면 횟수가 표시됨"
 elif grep -q "SEC 재무제표" "$LOG"; then
   SEC=$(grep -oE 'SEC [0-9]+/[0-9]+종목' "$LOG" | tail -1)
   echo "2/4단계 SEC 재무제표 받는 중 ${SEC:+— ${SEC#SEC }} (25종목마다 표시, 받은 자료는 7일간 재사용)"

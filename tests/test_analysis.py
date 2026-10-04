@@ -321,3 +321,35 @@ def test_run_stress_smoke(capsys):
     assert "① 큰 승자 빼기" in out and "상위 10 제외" in out and "가장 많이 번 5종목 제외" in out
     assert "② 무작위 8종목 × 4회" in out and "보유보다 높은 경우" in out
     assert analysis._pct([1, 2, 3, 4, 5], 0.5) == 3
+
+
+def test_momentum_skip_and_market_filter_goes_cash():
+    closes = [100 + i for i in range(300)]
+    ds = {"A": bars_from(closes), "B": bars_from([200 - i * 0.3 for i in range(300)])}
+    y = ds["A"][280]["date"]
+    assert analysis.momentum_score(ds, 252, 21)("A", y) == pytest.approx(closes[259] / closes[28] - 1)
+    sc = analysis.momentum_score(ds)
+    r = analysis.factor_portfolio(ds, sc, 1000, slots=1, market_ok=lambda d: False)
+    assert not r["trades"] and r["open"] == 0 and r["curve"][-1] == pytest.approx(1000)   # 시장 필터면 현금
+    r = analysis.factor_portfolio(ds, sc, 1000, slots=1)
+    assert r["open_syms"] == ["A"]
+
+
+def test_run_momvar_smoke(capsys):
+    import random
+    random.seed(5)
+
+    def walk(d):
+        p, cl = 50.0, []
+        for _ in range(560):
+            p *= 1 + d + random.gauss(0, 0.015)
+            cl.append(p)
+        return bars_from(cl)
+    from backtest import compact
+    full = {f"S{i:02d}": compact(walk(random.gauss(0.0004, 0.001))) for i in range(24)}
+    dates = [b["date"] for b in full["S00"]]
+    market = {d: i % 90 < 60 for i, d in enumerate(dates)}
+    analysis.run_momvar(full, full, 1100, {"fee_pct": 0.25, "slip_pct": 0.05}, market, trials=2, size=22)
+    out = capsys.readouterr().out
+    assert "모멘텀 변형 비교" in out and "12-1·상위10+시장" in out and "(참고)" in out
+    assert out.count(": 보유보다 높은 경우") == len(analysis.MOM_VARIANTS)
