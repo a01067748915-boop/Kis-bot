@@ -28,9 +28,13 @@ def gb(monkeypatch, tmp_path):
                  rsi_max_long=101.0, rsi_min_short=-1.0, tg_alerts=True, manual_trading=False,
                  manual_max_usdt=30.0, alert_symbols=["SOL_USDT"], alert_move_1h_pct=3.0,
                  alert_move_24h_pct=8.0, alert_check_sec=300, alert_cooldown_min=120)
-    sent = []
-    monkeypatch.setattr(m, "notify", lambda msg: sent.append(msg))
-    m.sent = sent
+    sent, buttons = [], []
+
+    def fake_notify(msg, btns=None):
+        sent.append(msg)
+        buttons.append(btns)
+    monkeypatch.setattr(m, "notify", fake_notify)
+    m.sent, m.buttons = sent, buttons
     m._contract_info.clear()
     m._lev_set.clear()
     m._err_seen.clear()
@@ -400,3 +404,67 @@ def test_compare_and_top(gb):
     out = gb.sent[-1]
     assert "TINY" not in out  # 거래대금 작은 코인 제외
     assert out.index("C19") < out.index("📉 하락") and "C0 " in out.split("📉 하락")[1]
+
+
+class Resp:
+    def __init__(self, data):
+        self._d = data
+
+    def json(self):
+        return self._d
+
+
+def test_buy_button_flow_through_telegram(gb, monkeypatch):
+    """분석 메시지의 '10 USDT 매수' 버튼 → 확인 메시지 '✅ 확정' 버튼 → 실제 주문"""
+    _tg_on(gb)
+    gb.CFG["manual_trading"] = True
+    g = AnalyzeGate(last=100.0)
+    st = gb.load_state()
+    gb.handle_command(g, st, "/analyze sol")
+    flat = [d for row in gb.buttons[-1] for _, d in row]
+    assert "buy:SOL_USDT:10" in flat and "alert:SOL_USDT:-5" in flat
+    queue = []
+    monkeypatch.setattr(gb.requests, "post", lambda *a, **k: Resp({"ok": True}))
+
+    def fake_get(*a, **k):
+        items = queue[:]
+        queue.clear()
+        return Resp({"result": items})
+    monkeypatch.setattr(gb.requests, "get", fake_get)
+
+    def press(data, chat="42"):
+        queue.append({"update_id": len(gb.sent), "callback_query": {
+            "id": "q", "data": data, "message": {"chat": {"id": chat}}}})
+        gb.poll_telegram(g, st)
+    press("buy:SOL_USDT:10", chat="999")  # 남의 채팅방 → 무시
+    assert "pending" not in st
+    press("buy:SOL_USDT:10")
+    code = st["pending"]["code"]
+    assert gb.buttons[-1] == [[("✅ 확정", f"confirm:{code}"), ("❌ 취소", "cancel")]] and not g.calls
+    press(f"confirm:{code}")
+    assert ("spot", "buy", "10.00") in g.calls and "수동 매수" in gb.sent[-1]
+    after = [d for row in gb.buttons[-1] for _, d in row]
+    assert "sell:SOL_USDT:all" in after and "alert:SOL_USDT:-5" in after
+    press("alert:SOL_USDT:-5")
+    assert st["alerts"][-1]["price"] == pytest.approx(95.0) and st["alerts"][-1]["dir"] == "down"
+
+
+def test_untradable_or_too_small_rejected(gb, monkeypatch):
+    _tg_on(gb)
+    gb.CFG["manual_trading"] = True
+    g = FakeGate(last=100.0)
+    st = gb.load_state()
+    monkeypatch.setattr(g, "spot_pair", lambda p: {"trade_status": "untradable"})
+    gb.handle_command(g, st, "/buy sol 10")
+    assert "거래할 수 없는" in gb.sent[-1] and "pending" not in st
+    monkeypatch.setattr(g, "spot_pair", lambda p: {"trade_status": "tradable", "min_quote_amount": "3"})
+    gb.handle_command(g, st, "/buy sol 2")
+    assert "3 USDT 이상" in gb.sent[-1]
+
+
+def test_top_has_analyze_buttons(gb):
+    _tg_on(gb)
+    g = AnalyzeGate()
+    gb.handle_command(g, gb.load_state(), "/top")
+    flat = [d for row in gb.buttons[-1] for _, d in row]
+    assert "an:C19_USDT" in flat and all(d.startswith("an:") for d in flat)

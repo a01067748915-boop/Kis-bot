@@ -108,13 +108,18 @@ def log(msg):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), redact(msg), flush=True)
 
 
-def notify(msg):
+def notify(msg, buttons=None):
+    """텔레그램 전송. buttons: [[(글자, 데이터), …], …] → 누르면 그 데이터로 명령 실행"""
     log(msg)
     if CFG["tg_token"] and CFG["tg_chat"]:
+        body = {"chat_id": CFG["tg_chat"], "text": redact(msg)}
+        if buttons:
+            body["reply_markup"] = {"inline_keyboard": [[{"text": t, "callback_data": d[:64]} for t, d in row]
+                                                        for row in buttons]}
         try:
             r = requests.post(
                 f"https://api.telegram.org/bot{CFG['tg_token']}/sendMessage",
-                json={"chat_id": CFG["tg_chat"], "text": redact(msg)},
+                json=body,
                 timeout=10,
             )
             if r.status_code != 200:
@@ -718,10 +723,15 @@ def poll_telegram(gate, st):
                          params=params, timeout=10).json()
         for u in r.get("result", []):
             _tg_offset = u["update_id"] + 1
-            msg = u.get("message") or {}
+            cq = u.get("callback_query")
+            msg = (cq.get("message") if cq else u.get("message")) or {}
             if str(msg.get("chat", {}).get("id")) != str(CFG["tg_chat"]):
-                continue  # 내 채팅방 명령만 처리
-            text = (msg.get("text") or "").strip()
+                continue  # 내 채팅방 명령·버튼만 처리
+            if cq:  # 버튼을 누름 → 같은 일을 하는 명령으로 바꿔 처리 (확인 절차 동일)
+                answer_button(cq.get("id"))
+                text = button_command(gate, cq.get("data") or "")
+            else:
+                text = (msg.get("text") or "").strip()
             try:
                 handle_command(gate, st, text)
             except Exception as e:
@@ -762,15 +772,18 @@ def handle_command(gate, st, text):
     elif cmd in ("/help", "/start", "도움말"):
         notify(HELP)
     elif cmd in ("/analyze", "/a", "분석") and args:
-        notify(analyze(gate, pair_of(args[0])))
+        pair = pair_of(args[0])
+        text = analyze(gate, pair)
+        notify(text, None if text.startswith("❌") else coin_buttons(pair))
     elif cmd in ("/compare", "비교") and args:
         notify(compare(gate, [pair_of(a) for a in args[:8]]))
     elif cmd in ("/top", "순위"):
-        notify(top_movers(gate))
+        text, pairs = top_movers(gate)
+        notify(text, [[(p.split("_")[0], f"an:{p}") for p in pairs[i:i + 4]] for i in range(0, len(pairs), 4)])
     elif cmd in ("/price", "가격") and args:
         pair = pair_of(args[0])
         t = gate.spot_ticker(pair)
-        notify(f"💲 {pair} {t['last']:g} (24시간 {t['change_24h']:+.2f}%)\n사려면: /buy {args[0].lower()} 10")
+        notify(f"💲 {pair} {t['last']:g} (24시간 {t['change_24h']:+.2f}%)", coin_buttons(pair, True))
     elif cmd in ("/alert", "알림") and len(args) >= 2:
         pair, target = pair_of(args[0]), float(args[1].replace(",", ""))
         last = gate.spot_last(pair)
@@ -898,7 +911,7 @@ def compare(gate, pairs):
 def top_movers(gate, n=5, min_qv=5e6):
     t = [x for x in gate.spot_tickers() if x["qv"] >= min_qv and x["last"] > 0]
     if not t:
-        return "❌ 시세를 받지 못했습니다"
+        return "❌ 시세를 받지 못했습니다", []
 
     def fmt(x):
         return f" {x['pair'].split('_')[0]:<7} {x['chg']:+6.1f}%  {x['last']:g}  ({_money(x['qv'])})"
@@ -909,7 +922,7 @@ def top_movers(gate, n=5, min_qv=5e6):
             "🚀 상승\n" + "\n".join(fmt(x) for x in up) +
             "\n📉 하락\n" + "\n".join(fmt(x) for x in down) +
             "\n💰 거래대금\n" + "\n".join(fmt(x) for x in big) +
-            "\n자세히: /analyze 코인")
+            "\n아래 버튼으로 분석 → 바로 매수"), [x["pair"] for x in up[:4] + big[:4]]
 
 
 # ───────────────────────── 알림 ─────────────────────────
@@ -925,7 +938,8 @@ def check_alerts(gate, st):
             px = prices.setdefault(a["pair"], gate.spot_last(a["pair"]))
             if (a["dir"] == "up" and px >= a["price"]) or (a["dir"] == "down" and px <= a["price"]):
                 coin = a["pair"].split("_")[0].lower()
-                notify(f"🔔 {a['pair']} {px:g} — 알림 #{a['id']} 가격({a['price']:g}) 도달\n사려면: /buy {coin} 10")
+                notify(f"🔔 {a['pair']} {px:g} — 알림 #{a['id']} 가격({a['price']:g}) 도달\n사려면: /buy {coin} 10",
+                       coin_buttons(a["pair"], True))
                 alerts.remove(a)
     if now - st.get("last_move_check", 0) < CFG["alert_check_sec"]:
         return
@@ -949,7 +963,8 @@ def check_alerts(gate, st):
                 seen[key] = now
                 coin = pair.split("_")[0].lower()
                 icon = "🚀" if chg > 0 else "📉"
-                notify(f"{icon} {pair} {label} {chg:+.1f}% → {t['last']:g}\n사려면: /buy {coin} 10   시세: /price {coin}")
+                notify(f"{icon} {pair} {label} {chg:+.1f}% → {t['last']:g}\n사려면: /buy {coin} 10   시세: /price {coin}",
+                       coin_buttons(pair, True))
 
 
 # ───────────────────────── 수동 매매 (텔레그램) ─────────────────────────
@@ -959,6 +974,10 @@ def prepare_manual(gate, st, side, args):
         notify("🔒 수동 매매가 꺼져 있습니다. 쓰려면 .env 에 MANUAL_TRADING=true 후 봇 재시작")
         return
     pair = pair_of(args[0])
+    info = gate.spot_pair(pair)
+    if info.get("trade_status", "tradable") != "tradable":
+        notify(f"⛔ {pair} 는 지금 거래할 수 없는 상태입니다 ({info.get('trade_status')})")
+        return
     last = gate.spot_last(pair)
     base = pair.split("_")[0]
     if side == "buy":
@@ -969,8 +988,9 @@ def prepare_manual(gate, st, side, args):
         if usdt > CFG["manual_max_usdt"]:
             notify(f"⛔ 1회 최대 {CFG['manual_max_usdt']:g} USDT (MANUAL_MAX_USDT)")
             return
-        if usdt < 1:
-            notify("⛔ 1 USDT 이상만 가능합니다")
+        min_usdt = max(1.0, _f(info.get("min_quote_amount")))
+        if usdt < min_usdt:
+            notify(f"⛔ {pair} 는 {min_usdt:g} USDT 이상만 살 수 있습니다")
             return
         desc = f"{pair} {usdt:g} USDT 시장가 매수 (약 {usdt / last:.6g} {base}, 수수료 약 {usdt * CFG['spot_fee_pct'] / 100:.3f})"
         order = {"side": "buy", "pair": pair, "usdt": usdt}
@@ -991,7 +1011,8 @@ def prepare_manual(gate, st, side, args):
     import random
     code = f"{random.SystemRandom().randint(0, 9999):04d}"
     st["pending"] = dict(order, code=code, until=time.time() + 60)
-    notify(f"🧾 {desc}\n현재가 {last:g}\n확정: /confirm {code}  (60초 안에)   취소: /cancel")
+    notify(f"🧾 {desc}\n현재가 {last:g}\n확정: /confirm {code}  (60초 안에)   취소: /cancel",
+           [[("✅ 확정", f"confirm:{code}"), ("❌ 취소", "cancel")]])
 
 
 def confirm_manual(gate, st, code):
@@ -1024,7 +1045,9 @@ def confirm_manual(gate, st, code):
         price = _f((r or {}).get("avg_deal_price")) or gate.spot_last(pair)
         log_trade("manual", pair, "buy", price, None, "텔레그램")
         notify(f"✅ [수동 매수] {pair} {got:.8g} {base} @ {price:g} ({o['usdt']:g} USDT)\n"
-               f"※ 자동 손절 없음 — 필요하면 /alert 로 가격 알림을 거세요")
+               f"※ 자동 손절 없음 — 필요하면 /alert 로 가격 알림을 거세요",
+               [[("🔔 -5% 손절 알림", f"alert:{pair}:-5"), ("🔔 +10% 익절 알림", f"alert:{pair}:10")],
+                [("💸 전부 매도", f"sell:{pair}:all"), ("🔎 분석", f"an:{pair}")]])
     else:
         prec = int(gate.spot_pair(pair).get("amount_precision", 6))
         qty = math.floor(o["qty"] * 10 ** prec) / 10 ** prec
@@ -1041,6 +1064,46 @@ def confirm_manual(gate, st, code):
         price = _f((r or {}).get("avg_deal_price")) or gate.spot_last(pair)
         log_trade("manual", pair, "sell", price, None, "텔레그램")
         notify(f"✅ [수동 매도] {pair} {qty:.8g} {base} @ {price:g} (약 {qty * price:.2f} USDT)")
+
+
+def answer_button(cq_id):
+    """버튼 누른 뒤 도는 표시 멈추기"""
+    try:
+        requests.post(f"https://api.telegram.org/bot{CFG['tg_token']}/answerCallbackQuery",
+                      json={"callback_query_id": cq_id}, timeout=10)
+    except Exception as e:
+        log(f"버튼 응답 실패: {e}")
+
+
+def button_command(gate, data):
+    """버튼 데이터 → 같은 일을 하는 텍스트 명령 (버튼도 명령과 똑같은 확인 절차를 거침)"""
+    kind, _, rest = data.partition(":")
+    if kind == "buy":            # buy:SOL_USDT:10
+        pair, usdt = rest.split(":")
+        return f"/buy {pair} {usdt}"
+    if kind == "sell":           # sell:SOL_USDT:all
+        pair, amt = rest.split(":")
+        return f"/sell {pair} {amt}"
+    if kind == "confirm":
+        return f"/confirm {rest}"
+    if kind == "cancel":
+        return "/cancel"
+    if kind == "an":
+        return f"/analyze {rest}"
+    if kind == "alert":          # alert:SOL_USDT:-5 → 지금 가격의 -5% 에 알림
+        pair, pct = rest.split(":")
+        target = gate.spot_last(pair) * (1 + float(pct) / 100)
+        return f"/alert {pair} {target:.10g}"
+    return ""
+
+
+def coin_buttons(pair, analyze_button=False):
+    """코인 메시지 아래 버튼: 바로 매수 + 가격 알림 (+ 분석)"""
+    rows = [[(f"💵 {a} USDT 매수", f"buy:{pair}:{a}") for a in (5, 10, 20)],
+            [("🔔 -5% 알림", f"alert:{pair}:-5"), ("🔔 +10% 알림", f"alert:{pair}:10")]]
+    if analyze_button:
+        rows[1].append(("🔎 분석", f"an:{pair}"))
+    return rows
 
 
 def maybe_daily_report(gate, st):
