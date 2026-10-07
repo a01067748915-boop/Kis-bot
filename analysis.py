@@ -50,16 +50,17 @@ def signal_portfolio(datasets, ind_fn, budget, slots=SLOTS, need_trend=True, sta
 
 
 def factor_portfolio(datasets, score, budget, slots=SLOTS, need_trend=False, start=None, ind=None, raw=None,
-                     market_ok=None, **opts):
-    """매달 첫 거래일 score(종목, 전날) 높은 순 상위 slots 개로 교체. score 가 None 이면 제외
-    market_ok(전날) 이 False 면 그달은 전부 팔고 현금 (시장 필터)"""
+                     market_ok=None, every=1, **opts):
+    """매달(every개월마다) 첫 거래일 score(종목, 전날) 높은 순 상위 slots 개로 교체. score 가 None 이면 제외
+    market_ok(전날) 이 False 면 그 기간은 전부 팔고 현금 (시장 필터). every=12 → 1년에 한 번 교체"""
     ind = ind or {s: indicators(b, 200) for s, b in datasets.items()}
     state = {"month": None, "target": []}
 
     def update(y):
-        if y[:6] == state["month"]:
+        period = (int(y[:4]) * 12 + int(y[4:6]) - 1) // every
+        if period == state["month"]:
             return
-        state["month"] = y[:6]
+        state["month"] = period
         if market_ok is not None and not market_ok(y):
             state["target"] = []
             return
@@ -482,6 +483,101 @@ def run_stress(full, raw, funds, budget, opts, trials=200, size=40, seed=1):
     print("  → '보유보다 높은 경우'가 80% 이상이고 하위10%도 0 근처면, 특정 종목 구성에 기대지 않는 전략")
 
 
+def quality_scores(funds, raw):
+    """장기 보유용 점수 함수들 — 수익성(ROE·영업이익률), 매출성장, 저평가(주가매출비율 낮을수록 높게)"""
+    rawpx = {s: {b["date"]: b["close"] for b in bs} for s, bs in raw.items()}
+
+    def roe(s, y):
+        f = funds.get(s)
+        return f.roe(y) if f and (f.revenue(y) or 0) >= MIN_REV else None
+
+    def opm(s, y):
+        f = funds.get(s)
+        return f.opm(y) if f and (f.revenue(y) or 0) >= MIN_REV else None
+
+    def growth(s, y):
+        return funds[s].growth(y, GROWTH_MIN_PREV) if s in funds else None
+
+    def cheap(s, y):
+        f, px = funds.get(s), rawpx.get(s, {}).get(y)
+        v = f.psr(y, px) if f and px else None
+        return -v if v else None
+    return {"roe": roe, "opm": opm, "growth": growth, "cheap": cheap}
+
+
+LONG_VARIANTS = [  # (이름, 점수 조합, 칸 수, 교체 주기(개월))
+    ("수익성 연1회·10", ("roe", "opm"), 10, 12),
+    ("수익성+성장 연1회·10", ("roe", "opm", "growth"), 10, 12),
+    ("수익성+저평가 연1회·10", ("roe", "opm", "cheap"), 10, 12),
+    ("수익성 연1회·20", ("roe", "opm"), 20, 12),
+    ("수익성 분기·10", ("roe", "opm"), 10, 3),
+]
+
+
+def run_longhold(full, raw, funds, budget, opts, trials=100, size=60, seed=1, big=5000.0):
+    """재무 기준으로 골라 길게 보유 — 연 1회(또는 분기) 교체, 10·20종목. 무작위 묶음·큰 승자 빼기로 견고성 확인"""
+    import random
+    start = common_start(full)
+    base_ind = {s: indicators(b, 200) for s, b in full.items()}
+    fs = quality_scores(funds, raw)
+
+    def strat(ds, v, bud):
+        _, keys, slots, every = v
+        sc = combo_score(list(ds), *[fs[k] for k in keys])
+        sub = {s: base_ind[s] for s in ds}
+        return lambda st: factor_portfolio(ds, sc, bud, slots=slots, start=st, ind=sub, raw=raw, every=every, **opts)
+
+    ref = strat(full, LONG_VARIANTS[0], big)(start)
+    dates = ref["dates"]
+    if not dates:
+        print("  데이터 부족")
+        return
+    starts = periods(dates)
+    print(f"\n━━ 장기 보유형 재무 전략 ({len(full)}종목 중 재무 있는 {len(funds)}종목, 실제 가격, "
+          f"매출 {MIN_REV / 1e6:.0f}백만$ 이상만) ━━")
+    for bud in (budget, big):
+        print(f"\n① 전체 종목 — 예산 {usd(bud)}")
+        print("  " + hold_line(full, starts, dates, bud, opts))
+        for v in LONG_VARIANTS:
+            r = run_all(strat(full, v, bud), starts)
+            print("  " + line(v[0], r, bud) + f" | 1주 못 사 건너뜀 {r[0][1]['skips']}회")
+    print(f"\n② 각 전략이 가장 많이 번 5종목 빼고 다시 ({usd(big)})")
+    for v in LONG_VARIANTS:
+        top = contributors(strat(full, v, big)(start))
+        if not top:
+            continue
+        ds = {s: b for s, b in full.items() if s not in top}
+        print(f"  ■ {v[0]} 기여 상위 제외: {', '.join(top)}")
+        print("  " + hold_line(ds, starts, dates, big, opts))
+        print("  " + line(v[0], run_all(strat(ds, v, big), starts), big))
+
+    rng = random.Random(seed)
+    pool = sorted(full)
+    size = min(size, len(pool))
+    print(f"\n③ 무작위 {size}종목 × {trials}회 ({usd(big)}, 전체 기간, seed={seed})")
+    res = {v[0]: {"ex": [], "mdd": []} for v in LONG_VARIANTS}
+    hold_mdd = []
+    for t in range(trials):
+        ds = {s: full[s] for s in rng.sample(pool, size)}
+        hc, _ = hold_curve(ds, dates, big, **opts)
+        hs = summary([x / big for x in hc])
+        hold_mdd.append(hs["낙폭"])
+        for v in LONG_VARIANTS:
+            sm = summary([x / big for x in strat(ds, v, big)(start)["curve"]])
+            res[v[0]]["ex"].append(sm["연"] - hs["연"])
+            res[v[0]]["mdd"].append(sm["낙폭"])
+        if (t + 1) % 25 == 0:
+            print(f"    … {t + 1}/{trials}회")
+    print(f"  균등 보유 최대낙폭 중앙값 {_pct(hold_mdd, 0.5):.0f}%")
+    for v in LONG_VARIANTS:
+        ex = res[v[0]]["ex"]
+        win = sum(x > 0 for x in ex) / len(ex) * 100
+        print(f"  {v[0]:<18}: 보유보다 높은 경우 {win:3.0f}% | 연수익 차이 중앙값 {_pct(ex, 0.5):+.0f}%p"
+              f" (하위10% {_pct(ex, 0.1):+.0f}%p ~ 상위10% {_pct(ex, 0.9):+.0f}%p)"
+              f" | 최대낙폭 중앙값 {_pct(res[v[0]]['mdd'], 0.5):.0f}%")
+    print("  → '보유보다 높은 경우' 80% 이상 + 하위10% 0 근처면 견고. 반반이면 지수 보유가 나음")
+
+
 MOM_VARIANTS = [  # (이름, 칸 수, 기간, 최근 제외일, 시장 필터)
     ("6개월·상위4(기존)", 4, 126, 0, False),
     ("12-1개월·상위4", 4, 252, 21, False),
@@ -615,11 +711,12 @@ def main():
     p.add_argument("--targets", default="@universes/growth_balanced.txt")
     p.add_argument("--add", default="@universes/growth_extra.txt", help="함께 쓸 종목 (none=안 씀)")
     p.add_argument("--years", type=int, default=10)
-    p.add_argument("--only", choices=["tech", "fund", "verify", "garp", "growthfix", "stress", "momvar"])
+    p.add_argument("--only", choices=["tech", "fund", "verify", "garp", "growthfix", "stress", "momvar", "longhold"])
     p.add_argument("--trials", type=int, default=200, help="stress: 무작위 묶음 반복 횟수")
     p.add_argument("--size", type=int, default=40, help="stress: 무작위 묶음 종목 수")
     p.add_argument("--picks", default="@universes/my_picks.txt", help="관심 종목 (garp 에서 따로 점검, none=안 씀)")
     p.add_argument("--fee", type=float, default=None)
+    p.add_argument("--cache-days", type=int, default=30, help="받은 시세를 며칠간 재사용 (백테스트는 길게 둬도 됨)")
     a = p.parse_args()
 
     load_dotenv(HERE / ".env")
@@ -636,7 +733,7 @@ def main():
     datasets = {}
     for sym, ex in targets.items():
         print(f"{sym} 일봉 수집 중…")
-        bars = try_fetch(api, sym, ex, a.years)
+        bars = try_fetch(api, sym, ex, a.years, max_age_days=a.cache_days)
         if not bars:
             print(f"  ⚠️ {sym}({ex}) 시세 없음 — 거래소 코드를 확인하세요 (제외)")
             continue
@@ -644,15 +741,16 @@ def main():
         datasets[sym] = compact(bars)
     budget = float(g("BUDGET_USD", "950"))
     opts = {"fee_pct": a.fee if a.fee is not None else float(g("FEE_PCT", "0.25")), "slip_pct": 0.05}
-    if a.only in ("verify", "garp", "growthfix", "stress", "momvar"):
+    if a.only in ("verify", "garp", "growthfix", "stress", "momvar", "longhold"):
         raw = {}
         for sym, ex in targets.items():
             if sym in datasets:
                 print(f"{sym} 실제 가격(분할 미반영) 수집 중…")
-                raw[sym] = compact(try_fetch(api, sym, ex, a.years, adjusted=False), keys=("open", "close"))
+                raw[sym] = compact(try_fetch(api, sym, ex, a.years, adjusted=False, max_age_days=a.cache_days),
+                                   keys=("open", "close"))
         if a.only == "momvar":
             print("SPY(시장 필터) 일봉 수집 중…")
-            spy = try_fetch(api, "SPY", "AMS", a.years)
+            spy = try_fetch(api, "SPY", "AMS", a.years, max_age_days=a.cache_days)
             market = {d: v["trend"] for d, v in market_indicators(spy).items()} if spy else {}
             run_momvar(datasets, raw, budget, opts, market, a.trials, a.size)
             print("\n※ 과거 성과가 미래 수익을 보장하지 않습니다.")
@@ -674,6 +772,8 @@ def main():
             run_growthfix(groups, raw, funds, budget, opts, list(picks))
         elif a.only == "stress":
             run_stress(datasets, raw, funds, budget, opts, a.trials, a.size)
+        elif a.only == "longhold":
+            run_longhold(datasets, raw, funds, budget, opts, a.trials, a.size)
         else:
             run_verify(groups, raw, funds, budget, opts)
         print("\n※ 과거 성과가 미래 수익을 보장하지 않습니다.")

@@ -35,7 +35,7 @@ if [ -n "$TRIAL" ]; then
   DONE=${TRIAL%%/*}; ALL=${TRIAL#*/}; ALL=${ALL%회}
   echo "4/4단계 무작위 묶음 검증: ${DONE}/${ALL}회 (25~50회마다 표시)"
   echo "   (이 단계는 남은 시간 계산 불가 — 횟수가 늘어나는 간격으로 가늠하세요)"
-elif grep -qE "견고성 검증|모멘텀 변형 비교" "$LOG"; then
+elif grep -qE "견고성 검증|모멘텀 변형 비교|장기 보유형" "$LOG"; then
   echo "3/4단계 전체 종목 계산 중 — 다음 단계(무작위 검증)로 넘어가면 횟수가 표시됨"
 elif grep -q "SEC 재무제표" "$LOG"; then
   SEC=$(grep -oE 'SEC [0-9]+/[0-9]+종목' "$LOG" | tail -1)

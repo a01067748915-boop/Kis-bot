@@ -80,12 +80,12 @@ def fetch_bars(api, sym, ex, years, adjusted=True, cache=HERE / "data" / "kis", 
     return bars
 
 
-def try_fetch(api, sym, ex, years, adjusted=True):
+def try_fetch(api, sym, ex, years, adjusted=True, max_age_days=3):
     """fetch_bars 와 같지만 한투 오류가 계속되면 그 종목만 건너뜀 (전체 실행이 멈추지 않게)"""
     from kis_api import KISError
     for attempt in range(2):
         try:
-            return fetch_bars(api, sym, ex, years, adjusted=adjusted)
+            return fetch_bars(api, sym, ex, years, adjusted=adjusted, max_age_days=max_age_days)
         except KISError as e:
             if attempt == 0:
                 print(f"  ↻ {sym} 조회 오류, 20초 뒤 다시 시도: {e}")

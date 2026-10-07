@@ -353,3 +353,68 @@ def test_run_momvar_smoke(capsys):
     out = capsys.readouterr().out
     assert "모멘텀 변형 비교" in out and "12-1·상위10+시장" in out and "(참고)" in out
     assert out.count(": 보유보다 높은 경우") == len(analysis.MOM_VARIANTS)
+
+
+def test_factor_portfolio_yearly_rebalance_only_on_new_year():
+    import random
+    random.seed(2)
+    ds = {f"S{i}": bars_from([100 * (1 + 0.001 * i) ** k * (1 + random.gauss(0, 0.01)) for k in range(800)])
+          for i in range(6)}
+    flip = {}
+
+    def score(s, y):  # 달마다 1등이 바뀌는 점수 → 매달 교체면 매매가 많고, 연 1회면 적어야 함
+        flip.setdefault(y[:6], random.random())
+        return (int(s[1]) + int(flip[y[:6]] * 6)) % 6
+    monthly = analysis.factor_portfolio(ds, score, 10000, slots=1)
+    yearly = analysis.factor_portfolio(ds, score, 10000, slots=1, every=12)
+    years = len({d[:4] for d in yearly["dates"]})
+    assert len(yearly["trades"]) <= years - 1 < len(monthly["trades"])  # 교체는 해가 바뀔 때만
+
+
+def test_opm_from_operating_income():
+    def q(tag, vals):
+        return {tag: {"units": {"USD": [{"start": f"2023-{m:02d}-01", "end": f"2023-{m + 2:02d}-28", "val": v,
+                                         "filed": f"2023-{m + 3:02d}-15"} for m, v in vals]}}}
+    facts = {"facts": {"us-gaap": {**q("Revenues", [(1, 100), (4, 100), (7, 100), (10, 100)]),
+                                   **q("OperatingIncomeLoss", [(1, 10), (4, 20), (7, 30), (10, 40)])}}}
+    f = fu.Fundamentals(facts)
+    assert f.opm("20240301") == pytest.approx(0.25)
+    assert f.opm("20230101") is None
+
+
+def test_run_longhold_smoke(capsys):
+    import random
+    random.seed(9)
+
+    def walk(d):
+        p, cl = 40.0, []
+        for _ in range(700):
+            p *= 1 + d + random.gauss(0, 0.012)
+            cl.append(p)
+        return bars_from(cl)
+    from backtest import compact
+    full = {f"S{i:02d}": compact(walk(random.gauss(0.0004, 0.001))) for i in range(26)}
+
+    class F:
+        def __init__(self, k):
+            self.k, self.rev = k, [1]
+
+        def revenue(self, y):
+            return 1e9
+
+        def roe(self, y):
+            return self.k
+
+        def opm(self, y):
+            return self.k / 2 + int(y[:4]) % 3 * 0.01
+
+        def growth(self, y, min_prev=None, cap=None):
+            return 0.1
+
+        def psr(self, y, px):
+            return 2.0 + self.k
+    funds = {s: F(random.random()) for s in full}
+    analysis.run_longhold(full, full, funds, 1100, {"fee_pct": 0.25, "slip_pct": 0.05}, trials=2, size=20)
+    out = capsys.readouterr().out
+    assert "장기 보유형 재무 전략" in out and "예산 $1,100" in out and "예산 $5,000" in out
+    assert out.count(": 보유보다 높은 경우") == len(analysis.LONG_VARIANTS)

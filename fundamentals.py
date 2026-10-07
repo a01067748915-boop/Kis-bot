@@ -9,6 +9,7 @@
 지표
   growth : 매출 성장률 — 최근 4분기 매출 합 ÷ 그 전 4분기 합 − 1
   roe    : 자기자본이익률 — 최근 4분기 순이익 합 ÷ 최근 자기자본
+  opm    : 영업이익률 — 최근 4분기 영업이익 합 ÷ 최근 4분기 매출 합
 """
 
 import json
@@ -26,6 +27,7 @@ FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
 REVENUE_TAGS = ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet",
                 "RevenueFromContractWithCustomerIncludingAssessedTax", "SalesRevenueGoodsNet"]
 NET_INCOME_TAGS = ["NetIncomeLoss", "ProfitLoss"]
+OPINC_TAGS = ["OperatingIncomeLoss"]
 EQUITY_TAGS = ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"]
 SHARE_TAGS = ["CommonStockSharesOutstanding"]  # dei:EntityCommonStockSharesOutstanding 이 없을 때
 
@@ -161,6 +163,7 @@ class Fundamentals:
     def __init__(self, facts):
         self.rev = quarterly(entries(facts, REVENUE_TAGS))
         self.ni = quarterly(entries(facts, NET_INCOME_TAGS))
+        self.op = quarterly(entries(facts, OPINC_TAGS))
         self.eq = entries(facts, EQUITY_TAGS)
         self.sh = share_entries(facts)
 
@@ -181,6 +184,11 @@ class Fundamentals:
             return None
         g = now / prev - 1
         return min(g, cap) if cap is not None else g
+
+    def opm(self, asof):
+        """영업이익률 = 최근 4분기 영업이익 합 ÷ 최근 4분기 매출 합"""
+        op, rev = ttm(self.op, asof), ttm(self.rev, asof)
+        return op / rev if op is not None and rev and rev > 0 else None
 
     def roe(self, asof):
         ni, eq = ttm(self.ni, asof), latest(self.eq, asof)
