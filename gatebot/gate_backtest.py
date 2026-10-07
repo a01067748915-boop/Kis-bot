@@ -4,6 +4,8 @@ Gate.io 봇 백테스트 — bot.py 와 '같은 신호 함수'로 과거 봉을 
   python3 gate_backtest.py              # .env 설정(종목·봉·EMA·손절/익절)으로 현물·선물 각각
   python3 gate_backtest.py --grid       # 봉 간격(15m/1h/4h) × EMA 조합 비교까지
   python3 gate_backtest.py --slip 0.1   # 슬리피지(편도 %) 바꾸기
+  python3 gate_backtest.py --alts --grid --brief   # 알트코인 10종 × 조합, 코인 전체 요약만
+  python3 gate_backtest.py --spot SOL_USDT,XRP_USDT --fut none   # 종목 직접 지정 (.env 는 그대로)
 
 가정
   - 마감된 봉에서 신호 → 다음 봉 시가에 진입/청산 (봇과 같은 타이밍)
@@ -23,6 +25,7 @@ from datetime import datetime
 import bot
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ALTS = "SOL_USDT,XRP_USDT,TRX_USDT,DOGE_USDT,ADA_USDT,AVAX_USDT,LINK_USDT,DOT_USDT,LTC_USDT,BCH_USDT"
 SEC = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
 
 
@@ -198,15 +201,26 @@ def hold_line(bars, market, p):
     return f"  {'(참고) 기간 가격 변화':<22} {chg * 100:+.1f}%"
 
 
+def syms(arg, default):
+    if arg is None:
+        return default
+    return [] if arg.lower() == "none" else [x.strip().upper() for x in arg.split(",") if x.strip()]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--grid", action="store_true", help="봉 간격 × EMA 조합 비교")
     ap.add_argument("--slip", type=float, default=0.05, help="슬리피지 편도 %%")
+    ap.add_argument("--spot", default=None, help="현물 종목 (쉼표, none=안 함). 없으면 .env")
+    ap.add_argument("--fut", default=None, help="선물 종목 (쉼표, none=안 함). 없으면 .env")
+    ap.add_argument("--alts", action="store_true", help="알트코인 10종(SOL·XRP·TRX·DOGE·ADA·AVAX·LINK·DOT·LTC·BCH)")
+    ap.add_argument("--brief", action="store_true", help="종목별 줄은 빼고 전체 요약만")
     a = ap.parse_args()
     p = dict(bot.CFG)
     gate = bot.Gate("", "")
-    jobs = [("spot", s, p["spot_fee_pct"]) for s in p["spot_symbols"]] + \
-           [("fut", s, p["fut_fee_pct"]) for s in p["futures_symbols"]]
+    spot = syms(ALTS if a.alts and a.spot is None else a.spot, p["spot_symbols"])
+    fut = syms(ALTS if a.alts and a.fut is None else a.fut, p["futures_symbols"])
+    jobs = [("spot", s, p["spot_fee_pct"]) for s in spot] + [("fut", s, p["fut_fee_pct"]) for s in fut]
     print(f"━━ Gate.io 봇 백테스트 — 1회 {p['order_usdt']:g} USDT, 선물 x{p['leverage']}, "
           f"손절 {p['stop_loss_pct']}% / 익절 {p['take_profit_pct']}%, 슬리피지 {a.slip}% ━━")
     print("   (현물 수수료 편도 %.2f%%, 선물 %.3f%%, 펀딩비 미반영)" % (p["spot_fee_pct"], p["fut_fee_pct"]))
@@ -214,6 +228,7 @@ def main():
     emas = [(p["ema_fast"], p["ema_slow"])] + ([e for e in ((9, 21), (20, 50), (50, 200))
                                                  if e != (p["ema_fast"], p["ema_slow"])] if a.grid else [])
     verdicts = []
+    summary = {}  # (시장, 봉, EMA) → [(종목, 순손익, 보유손익, 앞, 뒤)]
     for market, sym, fee in jobs:
         name = ("현물 " if market == "spot" else "선물 ") + sym
         for iv in intervals:
@@ -221,20 +236,36 @@ def main():
             try:
                 bars = fetch(gate, market, sym, iv)
             except Exception as e:
-                print(f"  ❌ 시세를 받지 못함: {bot.redact(e)[:120]}")
+                print(f"  ❌ 시세를 받지 못함 (종목 이름 확인): {bot.redact(e)[:120]}")
                 continue
             if len(bars) < 300:
                 print("  데이터 부족")
                 continue
             print(f"  기간 {period(bars)}")
-            print(hold_line(bars, market, p))
+            hold = p["order_usdt"] * (bars[-1]["c"] / bars[0]["o"] - 1)  # 같은 돈으로 현물 보유
+            if not a.brief:
+                print(hold_line(bars, market, p))
             for fe, sl in emas:
                 q = dict(p, ema_fast=fe, ema_slow=sl)
                 st = stats(simulate(bars, q, market, fee, a.slip))
-                label = f"EMA{fe}/{sl}" + (" (현재 설정)" if (iv, fe, sl) == (p["interval"], p["ema_fast"], p["ema_slow"]) else "")
-                print(line(label, st, p["order_usdt"]))
-                if (iv, fe, sl) == (p["interval"], p["ema_fast"], p["ema_slow"]):
+                cur = (iv, fe, sl) == (p["interval"], p["ema_fast"], p["ema_slow"])
+                if not a.brief:
+                    print(line(f"EMA{fe}/{sl}" + (" (현재 설정)" if cur else ""), st, p["order_usdt"]))
+                summary.setdefault((market, iv, fe, sl), []).append((sym, st["total"], hold, st["first"], st["second"]))
+                if cur:
                     verdicts.append((name, st))
+    if len(jobs) > 1 and summary:
+        print("\n━━ 코인 전체 요약 (조합별) — 여러 코인에서 고르게 통해야 운이 아님 ━━")
+        print("  시장 봉  EMA      | 이익 코인 | 보유보다 나은 코인 | 앞·뒤 모두 + | 순손익 합 (보유 합)")
+        for (market, iv, fe, sl), rows in sorted(summary.items(), key=lambda x: -sum(r[1] for r in x[1])):
+            n = len(rows)
+            pos = sum(1 for r in rows if r[1] > 0)
+            beat = sum(1 for r in rows if r[1] > r[2])
+            both = sum(1 for r in rows if r[3] > 0 and r[4] > 0)
+            mk = "현물" if market == "spot" else "선물"
+            print(f"  {mk} {iv:>3} {fe:>3}/{sl:<4} | {pos:>2}/{n} | {beat:>2}/{n} | {both:>2}/{n} | "
+                  f"{sum(r[1] for r in rows):+8.2f} ({sum(r[2] for r in rows):+.2f})")
+        print("  → '보유보다 나은 코인'이 대부분이고 '앞·뒤 모두 +'도 많아야 실전 후보. 한두 코인만 좋으면 우연")
     print("\n━━ 현재 설정 판정 ━━")
     for name, st in verdicts:
         if st["n"] < 20:

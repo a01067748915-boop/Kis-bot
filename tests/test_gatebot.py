@@ -256,3 +256,15 @@ def test_backtest_fetch_pages_back_and_stops_at_limit(bt, tmp_path, monkeypatch)
     assert len(got) == 2000 and got == sorted(got, key=lambda b: b["t"])
     assert got[-1]["t"] + 3600 <= now and got[0]["o"] == 10.0 and got[0]["h"] == 11.0
     assert bt.fetch(G(), "spot", "BTC_USDT", "1h", cache_dir=str(tmp_path)) == got and G.calls == 3  # 저장분
+
+
+def test_backtest_main_alts_summary(bt, monkeypatch, capsys):
+    import math
+    wave = [100 + 20 * math.sin(i / 15) + i * 0.05 for i in range(800)]
+    monkeypatch.setattr(bt, "fetch", lambda g, m, s, iv: bars(wave, wick=0.002))
+    monkeypatch.setattr(sys, "argv", ["gate_backtest.py", "--spot", "SOL_USDT,XRP_USDT", "--fut", "none",
+                                      "--grid", "--brief"])
+    bt.main()
+    out = capsys.readouterr().out
+    assert "코인 전체 요약" in out and "현물  1h" in out and " /2 |" in out.replace(" 0/2", " /2").replace(" 1/2", " /2").replace(" 2/2", " /2")
+    assert "현재 설정 판정" in out and "선물 SOL" not in out
