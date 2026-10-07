@@ -76,7 +76,7 @@ CFG = {
     "stop_loss_pct": env("STOP_LOSS_PCT", "3", float),
     "take_profit_pct": env("TAKE_PROFIT_PCT", "6", float),
     "exchange_stops": env("EXCHANGE_STOPS", "true", bool),  # 선물: 거래소 손절·익절 예약 주문
-    "spot_fee_pct": env("SPOT_FEE_PCT", "0.2", float),      # 모의·백테스트용 수수료(편도 %) — 실거래는 체결 내역 사용
+    "spot_fee_pct": env("SPOT_FEE_PCT", "0.1", float),      # 모의·백테스트용 수수료(편도 %) — 실거래는 체결 내역 사용
     "fut_fee_pct": env("FUT_FEE_PCT", "0.05", float),
     "daily_loss_limit_usdt": env("DAILY_LOSS_LIMIT_USDT", "10", float),
     "loop_sec": env("LOOP_SEC", "20", int),
