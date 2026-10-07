@@ -362,3 +362,41 @@ def test_help_and_price(gb):
     assert "XRP_USDT 1.5" in gb.sent[-1]
     gb.handle_command(g, st, "/help")
     assert "/alert" in gb.sent[-1]
+
+
+class AnalyzeGate(FakeGate):
+    def spot_bars(self, pair, interval, limit):
+        if pair == "NEW_USDT":
+            return [{"t": i, "o": 1, "h": 1, "l": 1, "c": 1, "qv": 1} for i in range(10)]
+        n = min(limit, 300)
+        return [{"t": i, "o": 100 + i * 0.5, "h": 101 + i * 0.5, "l": 99 + i * 0.5, "c": 100 + i * 0.5,
+                 "qv": 2e6 if i != n - 2 else 6e6} for i in range(n)]
+
+    def spot_tickers(self):
+        return [{"pair": f"C{i}_USDT", "last": 1.0 + i, "chg": i - 10.0, "qv": 1e7 * (i + 1)} for i in range(20)] + \
+               [{"pair": "TINY_USDT", "last": 1.0, "chg": 500.0, "qv": 100.0}]
+
+
+def test_analyze_uptrend_report(gb):
+    _tg_on(gb)
+    g = AnalyzeGate()
+    st = gb.load_state()
+    gb.handle_command(g, st, "/analyze sol")
+    out = gb.sent[-1]
+    assert "SOL_USDT 분석" in out and "강한 상승 추세" in out and "RSI(14)" in out
+    assert "7일 평균의 3.0배" in out and "/buy sol 10" in out and "추천이 아닙니다" in out
+    gb.handle_command(g, st, "분석 new")
+    assert "데이터가 부족" in gb.sent[-1]
+
+
+def test_compare_and_top(gb):
+    _tg_on(gb)
+    g = AnalyzeGate()
+    st = gb.load_state()
+    gb.handle_command(g, st, "/compare sol xrp new")
+    out = gb.sent[-1]
+    assert "📈SOL" in out and "📈XRP" in out and "NEW" in out and "데이터 부족" in out
+    gb.handle_command(g, st, "/top")
+    out = gb.sent[-1]
+    assert "TINY" not in out  # 거래대금 작은 코인 제외
+    assert out.index("C19") < out.index("📉 하락") and "C0 " in out.split("📉 하락")[1]

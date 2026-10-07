@@ -214,6 +214,18 @@ class Gate:
         rows = self.req("GET", "/spot/candlesticks", {"currency_pair": pair, "interval": interval, "limit": limit})
         return [float(r[2]) for r in rows]
 
+    def spot_bars(self, pair, interval, limit):
+        """[{t, o, h, l, c, qv(거래대금 USDT)}] 오래된 순"""
+        rows = self.req("GET", "/spot/candlesticks", {"currency_pair": pair, "interval": interval, "limit": limit})
+        return [{"t": int(r[0]), "qv": float(r[1]), "c": float(r[2]), "h": float(r[3]), "l": float(r[4]),
+                 "o": float(r[5])} for r in rows]
+
+    def spot_tickers(self):
+        """전체 현물 시세 [{pair, last, chg, qv}] (USDT 마켓만)"""
+        rows = self.req("GET", "/spot/tickers")
+        return [{"pair": r["currency_pair"], "last": _f(r.get("last")), "chg": _f(r.get("change_percentage")),
+                 "qv": _f(r.get("quote_volume"))} for r in rows if r.get("currency_pair", "").endswith("_USDT")]
+
     # 선물 (USDT 무기한)
     def fut_candles(self, contract, interval, limit=200):
         rows = self.req("GET", "/futures/usdt/candlesticks",
@@ -725,6 +737,9 @@ HELP = """📖 명령어
 /buy 코인 금액 — 시장가 매수 (예: /buy sol 10 → 10 USDT어치)
 /sell 코인 all|50% — 시장가 매도
 /confirm 코드 — 매수·매도 확정 (60초 안에)   /cancel — 취소
+/analyze 코인 — 추세·RSI·변동성·거래대금 분석 (예: /analyze sol)
+/compare 코인 코인 … — 여러 코인 한눈에 비교 (최대 8개)
+/top — 24시간 상승·하락·거래대금 순위
 /report — 리포트   /status — 상태"""
 
 
@@ -746,6 +761,12 @@ def handle_command(gate, st, text):
                f"가격 알림 {len(st.get('alerts', []))}개 · 수동 매매 {'켜짐' if CFG['manual_trading'] else '꺼짐'}")
     elif cmd in ("/help", "/start", "도움말"):
         notify(HELP)
+    elif cmd in ("/analyze", "/a", "분석") and args:
+        notify(analyze(gate, pair_of(args[0])))
+    elif cmd in ("/compare", "비교") and args:
+        notify(compare(gate, [pair_of(a) for a in args[:8]]))
+    elif cmd in ("/top", "순위"):
+        notify(top_movers(gate))
     elif cmd in ("/price", "가격") and args:
         pair = pair_of(args[0])
         t = gate.spot_ticker(pair)
@@ -774,6 +795,121 @@ def handle_command(gate, st, text):
     elif cmd in ("/cancel", "취소"):
         st.pop("pending", None)
         notify("❎ 주문 취소")
+
+
+# ───────────────────────── 코인 분석 ─────────────────────────
+def _chg(closes, n):
+    return (closes[-1] / closes[-1 - n] - 1) * 100 if len(closes) > n and closes[-1 - n] else None
+
+
+def _fmt(x, unit="%"):
+    return "-" if x is None else f"{x:+.1f}{unit}"
+
+
+def _money(x):
+    return f"{x / 1e9:.2f}B" if x >= 1e9 else f"{x / 1e6:.1f}M" if x >= 1e6 else f"{x / 1e3:.0f}K"
+
+
+def metrics(daily, h4=None):
+    """일봉(+4시간봉) → 지표 dict (분석·비교 공용)"""
+    c = [b["c"] for b in daily]
+    m = {"last": c[-1], "d1": _chg(c, 1), "d7": _chg(c, 7), "d30": _chg(c, 30), "d90": _chg(c, 90)}
+    for n in (20, 50, 200):
+        m[f"ema{n}"] = ema(c, n)[-1] if len(c) >= n else None
+    m["rsi_d"] = rsi(c, 14)[-1] if len(c) > 15 else None
+    m["rsi_4h"] = rsi([b["c"] for b in h4], 14)[-1] if h4 and len(h4) > 15 else None
+    rng = [(b["h"] - b["l"]) / b["c"] * 100 for b in daily[-14:] if b["c"]]
+    m["atr"] = sum(rng) / len(rng) if rng else None  # 하루 평균 변동폭 %
+    hi30 = max(b["h"] for b in daily[-30:])
+    lo30 = min(b["l"] for b in daily[-30:])
+    m["from_hi30"], m["from_lo30"] = (c[-1] / hi30 - 1) * 100, (c[-1] / lo30 - 1) * 100
+    hi_all = max(b["h"] for b in daily)
+    m["from_hi_all"], m["days"] = (c[-1] / hi_all - 1) * 100, len(daily)
+    qv = [b["qv"] for b in daily]
+    m["qv1"] = qv[-2]  # 마지막 일봉은 오늘(진행 중) → 어제 확정분 기준
+    m["qv_ratio"] = qv[-2] / (sum(qv[-9:-2]) / 7) if len(qv) >= 9 and sum(qv[-9:-2]) else None
+    above = [n for n in (20, 50, 200) if m[f"ema{n}"] and c[-1] > m[f"ema{n}"]]
+    if len(above) == 3 and m["ema20"] > m["ema50"] > m["ema200"]:
+        m["trend"] = "📈 강한 상승 추세 (가격 > 20·50·200일 평균, 정배열)"
+    elif m["ema200"] and c[-1] > m["ema200"]:
+        m["trend"] = "↗ 장기 상승 추세 안 (200일 평균 위)"
+    elif m["ema200"] and len(above) == 0:
+        m["trend"] = "📉 하락 추세 (가격 < 20·50·200일 평균)"
+    elif m["ema200"]:
+        m["trend"] = "↘ 장기 하락 추세 안 (200일 평균 아래)"
+    else:
+        m["trend"] = "상장 200일 미만 — 장기 추세 판단 불가"
+    return m
+
+
+def _rsi_word(r):
+    if r is None:
+        return "-"
+    return f"{r:.0f}" + (" 과열" if r >= 70 else " 과매도" if r <= 30 else "")
+
+
+def analyze(gate, pair):
+    daily = gate.spot_bars(pair, "1d", 400)
+    if len(daily) < 31:
+        return f"❌ {pair}: 데이터가 부족합니다 (상장 30일 미만이거나 이름 확인)"
+    h4 = gate.spot_bars(pair, "4h", 100)
+    m = metrics(daily, h4)
+    closes = [b["c"] for b in gate.spot_bars(pair, CFG["interval"], 200)][:-1]
+    sig = ""
+    if len(closes) > CFG["ema_slow"] + 2:
+        f, s_ = ema(closes, CFG["ema_fast"]), ema(closes, CFG["ema_slow"])
+        state = "위(상승 쪽)" if f[-1] > s_[-1] else "아래(하락 쪽)"
+        sig = f"\n🤖 봇 기준({CFG['interval']}봉 EMA{CFG['ema_fast']}/{CFG['ema_slow']}): 단기선이 장기선 {state}"
+    coin = pair.split("_")[0].lower()
+    vol = "" if m["qv_ratio"] is None else f" (최근 7일 평균의 {m['qv_ratio']:.1f}배)"
+    return (f"🔎 {pair} 분석  {time.strftime('%m/%d %H:%M')}\n"
+            f"현재가 {m['last']:g}\n"
+            f"수익률  1일 {_fmt(m['d1'])} · 7일 {_fmt(m['d7'])} · 30일 {_fmt(m['d30'])} · 90일 {_fmt(m['d90'])}\n"
+            f"추세  {m['trend']}\n"
+            f"평균선  20일 {m['ema20']:g} · 50일 {m['ema50'] or 0:g} · 200일 {m['ema200'] or 0:g}\n"
+            f"RSI(14)  일봉 {_rsi_word(m['rsi_d'])} · 4시간봉 {_rsi_word(m['rsi_4h'])}\n"
+            f"변동성  하루 평균 {m['atr']:.1f}% 움직임\n"
+            f"위치  30일 고점 대비 {_fmt(m['from_hi30'])} · 30일 저점 대비 {_fmt(m['from_lo30'])} · "
+            f"{m['days']}일 최고가 대비 {_fmt(m['from_hi_all'])}\n"
+            f"거래대금  어제 {_money(m['qv1'])} USDT{vol}"
+            f"{sig}\n\n"
+            f"사려면 /buy {coin} 10 · 알림 /alert {coin} 가격\n"
+            f"※ 지표는 과거 가격 요약일 뿐 매수·매도 추천이 아닙니다")
+
+
+def compare(gate, pairs):
+    rows = []
+    for p in pairs:
+        try:
+            d = gate.spot_bars(p, "1d", 400)
+            if len(d) < 31:
+                rows.append(f"{p.split('_')[0]:<6} 데이터 부족")
+                continue
+            m = metrics(d)
+            mark = "📈" if m["ema200"] and m["last"] > m["ema200"] else "📉" if m["ema200"] else "·"
+            rows.append(f"{mark}{p.split('_')[0]:<5} 7일 {_fmt(m['d7']):>7} 30일 {_fmt(m['d30']):>7} "
+                        f"RSI {m['rsi_d']:.0f} 변동 {m['atr']:.1f}% 고점比 {_fmt(m['from_hi_all'])}")
+        except Exception as e:
+            rows.append(f"{p.split('_')[0]:<6} 조회 실패 ({redact(e)[:40]})")
+    return ("📊 코인 비교 (일봉 기준)\n" + "\n".join(rows) +
+            "\n📈 200일 평균 위 / 📉 아래 · 변동 = 하루 평균 움직임 · 고점比 = 최근 400일 최고가 대비")
+
+
+def top_movers(gate, n=5, min_qv=5e6):
+    t = [x for x in gate.spot_tickers() if x["qv"] >= min_qv and x["last"] > 0]
+    if not t:
+        return "❌ 시세를 받지 못했습니다"
+
+    def fmt(x):
+        return f" {x['pair'].split('_')[0]:<7} {x['chg']:+6.1f}%  {x['last']:g}  ({_money(x['qv'])})"
+    up = sorted(t, key=lambda x: -x["chg"])[:n]
+    down = sorted(t, key=lambda x: x["chg"])[:n]
+    big = sorted(t, key=lambda x: -x["qv"])[:n]
+    return (f"🏆 24시간 순위 (거래대금 {_money(min_qv)} USDT 이상 {len(t)}개 중)\n"
+            "🚀 상승\n" + "\n".join(fmt(x) for x in up) +
+            "\n📉 하락\n" + "\n".join(fmt(x) for x in down) +
+            "\n💰 거래대금\n" + "\n".join(fmt(x) for x in big) +
+            "\n자세히: /analyze 코인")
 
 
 # ───────────────────────── 알림 ─────────────────────────

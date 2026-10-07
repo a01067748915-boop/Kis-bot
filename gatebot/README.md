@@ -49,6 +49,9 @@ cd /opt/gatebot && sudo -u gatebot python3 gate_backtest.py --grid
 | `/alert btc 60000` | 그 가격에 도달하면 한 번 알림 (`/alerts` 목록, `/delalert 1` 삭제) |
 | `/buy sol 10` | 10 USDT어치 시장가 매수 → 확인 코드가 오면 `/confirm 코드` (60초 안) |
 | `/sell sol all`, `/sell sol 50%` | 시장가 매도 → `/confirm 코드` |
+| `/analyze sol` | 코인 분석: 1·7·30·90일 수익률, 추세(20·50·200일 평균), RSI, 하루 평균 변동폭, 고점·저점 대비 위치, 거래대금 |
+| `/compare sol xrp trx` | 여러 코인(최대 8개) 한눈에 비교 |
+| `/top` | 24시간 상승·하락·거래대금 순위 (거래대금 500만 USDT 이상) |
 | `/report`, `/status`, `/help` | 리포트·상태·도움말 |
 
 - 급등락 알림: `ALERT_SYMBOLS` 코인이 1시간 ±3% 또는 24시간 ±8% 움직이면 알림 (같은 알림은 2시간에 한 번)
