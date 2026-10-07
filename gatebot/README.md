@@ -42,7 +42,20 @@ cd /opt/gatebot && sudo -u gatebot python3 gate_backtest.py --grid
 | 지금 리포트 | `cd /opt/gatebot && sudo -u gatebot python3 bot.py report` |
 | 멈추기 | `sudo systemctl stop gatebot` |
 
-텔레그램: `/report`(리포트), `/status`(상태). 매일 `REPORT_HOUR` 시에 리포트 자동 전송.
+## 텔레그램 명령
+| 명령 | 내용 |
+|---|---|
+| `/price sol` | 현재가·24시간 변동 |
+| `/alert btc 60000` | 그 가격에 도달하면 한 번 알림 (`/alerts` 목록, `/delalert 1` 삭제) |
+| `/buy sol 10` | 10 USDT어치 시장가 매수 → 확인 코드가 오면 `/confirm 코드` (60초 안) |
+| `/sell sol all`, `/sell sol 50%` | 시장가 매도 → `/confirm 코드` |
+| `/report`, `/status`, `/help` | 리포트·상태·도움말 |
+
+- 급등락 알림: `ALERT_SYMBOLS` 코인이 1시간 ±3% 또는 24시간 ±8% 움직이면 알림 (같은 알림은 2시간에 한 번)
+- 수동 매매는 `MANUAL_TRADING=true` 일 때만, 1회 최대 `MANUAL_MAX_USDT`. 자동매매가 모의여도 **실제 주문**이 나갑니다
+- 확인 코드가 틀리면 대기 주문은 바로 취소, 내 채팅방(TELEGRAM_CHAT_ID) 명령만 받음
+- 수동으로 산 코인은 자동 손절이 없습니다 — 필요하면 `/alert` 로 가격 알림을 거세요
+- 매일 `REPORT_HOUR` 시에 리포트 자동 전송
 
 ## API 키 권한
 - Spot·Perpetual Futures 만 Read-Write, **출금(Withdrawal)·이체는 끄기**

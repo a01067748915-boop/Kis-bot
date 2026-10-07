@@ -25,7 +25,9 @@ def gb(monkeypatch, tmp_path):
                  stop_loss_pct=3.0, take_profit_pct=6.0, spot_fee_pct=0.2, fut_fee_pct=0.05,
                  order_usdt=20.0, leverage=3, exchange_stops=True, reverse_on_signal=False,
                  daily_loss_limit_usdt=10.0, allow_short=True, ema_fast=3, ema_slow=6, rsi_period=3,
-                 rsi_max_long=101.0, rsi_min_short=-1.0)
+                 rsi_max_long=101.0, rsi_min_short=-1.0, tg_alerts=True, manual_trading=False,
+                 manual_max_usdt=30.0, alert_symbols=["SOL_USDT"], alert_move_1h_pct=3.0,
+                 alert_move_24h_pct=8.0, alert_check_sec=300, alert_cooldown_min=120)
     sent = []
     monkeypatch.setattr(m, "notify", lambda msg: sent.append(msg))
     m.sent = sent
@@ -50,6 +52,12 @@ class FakeGate:
 
     fut_last = spot_last
 
+    def spot_ticker(self, pair):
+        return {"last": self.last, "change_24h": getattr(self, "chg24", 0.0)}
+
+    def spot_closes(self, pair, interval, limit):
+        return [getattr(self, "hour_ago", self.last)] * limit
+
     def spot_candles(self, pair, interval):
         return [{"t": i, "c": c, "closed": True} for i, c in enumerate(self.closes)]
 
@@ -64,11 +72,12 @@ class FakeGate:
 
     def spot_market(self, pair, side, amount):
         self.calls.append(("spot", side, amount))
+        base = pair.split("_")[0]
         if side == "buy":
-            self.bal["BTC"] += float(amount) / self.last * 0.998
+            self.bal[base] = self.bal.get(base, 0.0) + float(amount) / self.last * 0.998
             self.bal["USDT"] -= float(amount)
         else:
-            self.bal["BTC"] -= float(amount)
+            self.bal[base] -= float(amount)
         if self.fail_order:
             raise RuntimeError("POST /spot/orders 502: timeout")
         return {"avg_deal_price": str(self.last), "filled_total": str(float(amount) if side == "buy"
@@ -268,3 +277,88 @@ def test_backtest_main_alts_summary(bt, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "코인 전체 요약" in out and "현물  1h" in out and " /2 |" in out.replace(" 0/2", " /2").replace(" 1/2", " /2").replace(" 2/2", " /2")
     assert "현재 설정 판정" in out and "선물 SOL" not in out
+
+
+def _tg_on(gb):
+    gb.CFG["tg_token"], gb.CFG["tg_chat"] = "1:x", "42"
+
+
+def test_price_alert_fires_once_with_buy_hint(gb):
+    _tg_on(gb)
+    g = FakeGate(last=100.0)
+    st = gb.load_state()
+    gb.handle_command(g, st, "/alert sol 110")
+    assert st["alerts"][0]["dir"] == "up" and st["alerts"][0]["pair"] == "SOL_USDT"
+    st["last_move_check"] = 10 ** 12  # 급등락 확인은 이번엔 건너뜀
+    gb.check_alerts(g, st)
+    assert len(gb.sent) == 1  # 아직 미도달
+    g.last = 111.0
+    gb.check_alerts(g, st)
+    assert "알림 #1" in gb.sent[-1] and "/buy sol 10" in gb.sent[-1] and st["alerts"] == []
+
+
+def test_move_alert_with_cooldown(gb):
+    _tg_on(gb)
+    g = FakeGate(last=104.0)
+    g.hour_ago = 100.0  # 1시간 +4%
+    st = gb.load_state()
+    gb.check_alerts(g, st)
+    assert any("1시간 +4.0%" in m for m in gb.sent)
+    n = len(gb.sent)
+    st["last_move_check"] = 0
+    gb.check_alerts(g, st)
+    assert len(gb.sent) == n  # 2시간 안엔 같은 알림 안 보냄
+
+
+def test_manual_buy_needs_switch_and_confirmation(gb):
+    _tg_on(gb)
+    g = FakeGate(last=100.0)
+    st = gb.load_state()
+    gb.handle_command(g, st, "/buy sol 10")
+    assert "수동 매매가 꺼져" in gb.sent[-1] and not g.calls
+    gb.CFG["manual_trading"] = True
+    gb.handle_command(g, st, "/buy sol 50")
+    assert "최대 30" in gb.sent[-1]
+    gb.handle_command(g, st, "/buy sol 10")
+    code = st["pending"]["code"]
+    assert not g.calls  # 확인 전엔 주문 안 나감
+    gb.handle_command(g, st, "/confirm 9999" if code != "9999" else "/confirm 0000")
+    assert not g.calls and "pending" not in st  # 틀린 코드 → 취소
+    gb.handle_command(g, st, "/buy sol 10")
+    gb.handle_command(g, st, f"/confirm {st['pending']['code']}")
+    assert ("spot", "buy", "10.00") in g.calls and "수동 매수" in gb.sent[-1]
+    t = gb.read_trades()[-1]
+    assert t["market"] == "manual" and t["dry"] is False  # 자동매매가 모의여도 실제 주문 기록
+
+
+def test_manual_order_expires(gb, monkeypatch):
+    _tg_on(gb)
+    gb.CFG["manual_trading"] = True
+    g = FakeGate(last=100.0)
+    st = gb.load_state()
+    gb.handle_command(g, st, "/buy sol 10")
+    st["pending"]["until"] = 0
+    gb.handle_command(g, st, f"/confirm {st['pending']['code']}")
+    assert not g.calls and "60초" in gb.sent[-1]
+
+
+def test_manual_sell_percent(gb):
+    _tg_on(gb)
+    gb.CFG["manual_trading"] = True
+    g = FakeGate(last=100.0)
+    g.bal["BTC"] = 0.2
+    st = gb.load_state()
+    gb.handle_command(g, st, "/sell btc 50%")
+    assert st["pending"]["qty"] == pytest.approx(0.1)
+    gb.handle_command(g, st, f"/confirm {st['pending']['code']}")
+    assert ("spot", "sell", "0.100000") in g.calls and g.bal["BTC"] == pytest.approx(0.1)
+
+
+def test_help_and_price(gb):
+    _tg_on(gb)
+    g = FakeGate(last=1.5)
+    st = gb.load_state()
+    gb.handle_command(g, st, "/price xrp")
+    assert "XRP_USDT 1.5" in gb.sent[-1]
+    gb.handle_command(g, st, "/help")
+    assert "/alert" in gb.sent[-1]

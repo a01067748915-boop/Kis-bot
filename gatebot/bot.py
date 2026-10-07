@@ -83,6 +83,14 @@ CFG = {
     "tg_token": env("TELEGRAM_TOKEN", ""),
     "tg_chat": env("TELEGRAM_CHAT_ID", ""),
     "report_hour": env("REPORT_HOUR", "9", int),           # 매일 이 시각(서버 시간)에 리포트, -1이면 끔
+    # 알림·수동 매매 (텔레그램)
+    "alert_symbols": [s for s in env("ALERT_SYMBOLS", "BTC_USDT,ETH_USDT,SOL_USDT,XRP_USDT,TRX_USDT").split(",") if s],
+    "alert_move_1h_pct": env("ALERT_MOVE_1H_PCT", "3", float),     # 1시간 ±이만큼 움직이면 알림 (0=끔)
+    "alert_move_24h_pct": env("ALERT_MOVE_24H_PCT", "8", float),   # 24시간 ±이만큼 움직이면 알림 (0=끔)
+    "alert_check_sec": env("ALERT_CHECK_SEC", "300", int),         # 급등락 확인 간격(초)
+    "alert_cooldown_min": env("ALERT_COOLDOWN_MIN", "120", int),   # 같은 코인 같은 알림은 이 시간에 한 번
+    "manual_trading": env("MANUAL_TRADING", "false", bool),        # 텔레그램 /buy /sell 로 실제 주문 (자동매매 모의와 별개)
+    "manual_max_usdt": env("MANUAL_MAX_USDT", "30", float),        # 수동 1회 최대 금액
 }
 
 
@@ -133,7 +141,8 @@ def notify_error(e):
 
 
 def log_trade(market, symbol, action, price, pnl=None, reason=""):
-    rec = {"ts": int(time.time()), "dry": CFG["dry_run"], "market": market, "symbol": symbol,
+    dry = CFG["dry_run"] and market != "manual"  # 수동 주문은 항상 실제 주문
+    rec = {"ts": int(time.time()), "dry": dry, "market": market, "symbol": symbol,
            "action": action, "price": price, "pnl": pnl, "reason": reason}
     with open(TRADES_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -195,6 +204,15 @@ class Gate:
     def spot_last(self, pair):
         rows = self.req("GET", "/spot/tickers", {"currency_pair": pair})
         return float(rows[0]["last"])
+
+    def spot_ticker(self, pair):
+        """{last, change_24h(%)}"""
+        r = self.req("GET", "/spot/tickers", {"currency_pair": pair})[0]
+        return {"last": float(r["last"]), "change_24h": _f(r.get("change_percentage"))}
+
+    def spot_closes(self, pair, interval, limit):
+        rows = self.req("GET", "/spot/candlesticks", {"currency_pair": pair, "interval": interval, "limit": limit})
+        return [float(r[2]) for r in rows]
 
     # 선물 (USDT 무기한)
     def fut_candles(self, contract, interval, limit=200):
@@ -607,7 +625,7 @@ def summarize(trades):
 
 def build_report(gate, st):
     now = time.time()
-    trades = [t for t in read_trades() if t["dry"] == CFG["dry_run"]]
+    trades = [t for t in read_trades() if t["dry"] == CFG["dry_run"] or t["market"] == "manual"]
     today0 = time.mktime(time.strptime(time.strftime("%Y-%m-%d"), "%Y-%m-%d"))
     lines = [f"📊 {tag()}Gate.io 봇 리포트  {time.strftime('%m/%d %H:%M')}", ""]
 
@@ -647,7 +665,8 @@ def build_report(gate, st):
         names = {"buy": "매수", "sell": "매도", "long": "롱 진입", "short": "숏 진입", "close": "청산"}
         for t in reversed(recent):
             p = f" {t['pnl']:+.2f}" if t["pnl"] is not None else ""
-            lines.append(f" · {time.strftime('%m/%d %H:%M', time.localtime(t['ts']))} "
+            hand = "✋수동 " if t["market"] == "manual" else ""
+            lines.append(f" · {time.strftime('%m/%d %H:%M', time.localtime(t['ts']))} {hand}"
                          f"{t['symbol']} {names.get(t['action'], t['action'])} @ {t['price']:g}{p}")
 
     lines += ["", "※ 손익은 수수료 포함, 선물 펀딩비 미포함"]
@@ -675,7 +694,7 @@ def skip_old_telegram():
 
 
 def poll_telegram(gate, st):
-    """텔레그램 명령 처리: /report, /status"""
+    """텔레그램 명령 받기 → handle_command"""
     global _tg_offset
     if not (CFG["tg_token"] and CFG["tg_chat"]):
         return
@@ -690,14 +709,202 @@ def poll_telegram(gate, st):
             msg = u.get("message") or {}
             if str(msg.get("chat", {}).get("id")) != str(CFG["tg_chat"]):
                 continue  # 내 채팅방 명령만 처리
-            text = (msg.get("text") or "").strip().lower()
-            if text.startswith(("/report", "리포트", "기록")):
-                notify(build_report(gate, st))
-            elif text.startswith(("/status", "상태")):
-                notify(f"✅ {tag()}작동 중 · 보유 {len(st['positions'])}개 · 오늘 손익 "
-                       f"{st['day_pnl'] if st['day'] == time.strftime('%Y-%m-%d') else 0:+.2f} USDT")
+            text = (msg.get("text") or "").strip()
+            try:
+                handle_command(gate, st, text)
+            except Exception as e:
+                notify(f"⚠️ 명령 처리 실패: {redact(e)[:200]}")
     except Exception as e:
         log(f"텔레그램 명령 확인 실패: {e}")
+
+
+HELP = """📖 명령어
+/price 코인 — 현재가·24시간 변동 (예: /price sol)
+/alert 코인 가격 — 그 가격 도달 시 알림 (예: /alert btc 60000)
+/alerts — 알림 목록   /delalert 번호 — 알림 삭제
+/buy 코인 금액 — 시장가 매수 (예: /buy sol 10 → 10 USDT어치)
+/sell 코인 all|50% — 시장가 매도
+/confirm 코드 — 매수·매도 확정 (60초 안에)   /cancel — 취소
+/report — 리포트   /status — 상태"""
+
+
+def pair_of(word):
+    w = word.upper().replace("/", "_").replace("-", "_")
+    return w if "_" in w else f"{w}_USDT"
+
+
+def handle_command(gate, st, text):
+    parts = text.split()
+    if not parts:
+        return
+    cmd, args = parts[0].lower().split("@")[0], parts[1:]
+    if cmd in ("/report", "리포트", "기록"):
+        notify(build_report(gate, st))
+    elif cmd in ("/status", "상태"):
+        notify(f"✅ {tag()}작동 중 · 보유 {len(st['positions'])}개 · 오늘 손익 "
+               f"{st['day_pnl'] if st['day'] == time.strftime('%Y-%m-%d') else 0:+.2f} USDT · "
+               f"가격 알림 {len(st.get('alerts', []))}개 · 수동 매매 {'켜짐' if CFG['manual_trading'] else '꺼짐'}")
+    elif cmd in ("/help", "/start", "도움말"):
+        notify(HELP)
+    elif cmd in ("/price", "가격") and args:
+        pair = pair_of(args[0])
+        t = gate.spot_ticker(pair)
+        notify(f"💲 {pair} {t['last']:g} (24시간 {t['change_24h']:+.2f}%)\n사려면: /buy {args[0].lower()} 10")
+    elif cmd in ("/alert", "알림") and len(args) >= 2:
+        pair, target = pair_of(args[0]), float(args[1].replace(",", ""))
+        last = gate.spot_last(pair)
+        alerts = st.setdefault("alerts", [])
+        aid = max([a["id"] for a in alerts], default=0) + 1
+        alerts.append({"id": aid, "pair": pair, "price": target, "dir": "up" if target > last else "down"})
+        notify(f"🔔 알림 #{aid} 등록: {pair} {'↑' if target > last else '↓'} {target:g} (지금 {last:g})")
+    elif cmd in ("/alerts", "알림목록"):
+        alerts = st.get("alerts", [])
+        notify("🔔 가격 알림\n" + ("\n".join(f" #{a['id']} {a['pair']} {'↑' if a['dir'] == 'up' else '↓'} {a['price']:g}"
+                                            for a in alerts) or " 없음") +
+               f"\n급등락 알림: {', '.join(CFG['alert_symbols'])} (1시간 ±{CFG['alert_move_1h_pct']:g}%, "
+               f"24시간 ±{CFG['alert_move_24h_pct']:g}%)")
+    elif cmd in ("/delalert", "알림삭제") and args:
+        n = int(args[0].lstrip("#"))
+        st["alerts"] = [a for a in st.get("alerts", []) if a["id"] != n]
+        notify(f"🗑 알림 #{n} 삭제")
+    elif cmd in ("/buy", "매수", "/sell", "매도") and args:
+        prepare_manual(gate, st, "buy" if cmd in ("/buy", "매수") else "sell", args)
+    elif cmd in ("/confirm", "확인") and args:
+        confirm_manual(gate, st, args[0])
+    elif cmd in ("/cancel", "취소"):
+        st.pop("pending", None)
+        notify("❎ 주문 취소")
+
+
+# ───────────────────────── 알림 ─────────────────────────
+def check_alerts(gate, st):
+    """가격 알림(도달 시 1회) + 급등락 알림 (ALERT_CHECK_SEC 마다)"""
+    if not (CFG["tg_token"] and CFG["tg_chat"]):
+        return
+    now = time.time()
+    alerts = st.get("alerts", [])
+    if alerts:
+        prices = {}
+        for a in list(alerts):
+            px = prices.setdefault(a["pair"], gate.spot_last(a["pair"]))
+            if (a["dir"] == "up" and px >= a["price"]) or (a["dir"] == "down" and px <= a["price"]):
+                coin = a["pair"].split("_")[0].lower()
+                notify(f"🔔 {a['pair']} {px:g} — 알림 #{a['id']} 가격({a['price']:g}) 도달\n사려면: /buy {coin} 10")
+                alerts.remove(a)
+    if now - st.get("last_move_check", 0) < CFG["alert_check_sec"]:
+        return
+    st["last_move_check"] = now
+    seen = st.setdefault("move_alerted", {})
+    for pair in CFG["alert_symbols"]:
+        try:
+            t = gate.spot_ticker(pair)
+            closes = gate.spot_closes(pair, "5m", 13) if CFG["alert_move_1h_pct"] else []
+        except Exception as e:
+            log(f"급등락 확인 실패 {pair}: {e}")
+            continue
+        moves = []
+        if len(closes) >= 13 and closes[0]:
+            moves.append(("1시간", (t["last"] / closes[0] - 1) * 100, CFG["alert_move_1h_pct"]))
+        if CFG["alert_move_24h_pct"]:
+            moves.append(("24시간", t["change_24h"], CFG["alert_move_24h_pct"]))
+        for label, chg, limit in moves:
+            key = f"{pair}:{label}:{'up' if chg > 0 else 'down'}"
+            if limit and abs(chg) >= limit and now - seen.get(key, 0) >= CFG["alert_cooldown_min"] * 60:
+                seen[key] = now
+                coin = pair.split("_")[0].lower()
+                icon = "🚀" if chg > 0 else "📉"
+                notify(f"{icon} {pair} {label} {chg:+.1f}% → {t['last']:g}\n사려면: /buy {coin} 10   시세: /price {coin}")
+
+
+# ───────────────────────── 수동 매매 (텔레그램) ─────────────────────────
+def prepare_manual(gate, st, side, args):
+    """주문 내용을 보여주고 확인 코드를 줌 → /confirm 코드 로 60초 안에 확정"""
+    if not CFG["manual_trading"]:
+        notify("🔒 수동 매매가 꺼져 있습니다. 쓰려면 .env 에 MANUAL_TRADING=true 후 봇 재시작")
+        return
+    pair = pair_of(args[0])
+    last = gate.spot_last(pair)
+    base = pair.split("_")[0]
+    if side == "buy":
+        if len(args) < 2:
+            notify("사용법: /buy 코인 금액  (예: /buy sol 10)")
+            return
+        usdt = float(args[1])
+        if usdt > CFG["manual_max_usdt"]:
+            notify(f"⛔ 1회 최대 {CFG['manual_max_usdt']:g} USDT (MANUAL_MAX_USDT)")
+            return
+        if usdt < 1:
+            notify("⛔ 1 USDT 이상만 가능합니다")
+            return
+        desc = f"{pair} {usdt:g} USDT 시장가 매수 (약 {usdt / last:.6g} {base}, 수수료 약 {usdt * CFG['spot_fee_pct'] / 100:.3f})"
+        order = {"side": "buy", "pair": pair, "usdt": usdt}
+    else:
+        bot_qty = sum(p["qty"] for k, p in st["positions"].items()
+                      if k == f"spot:{pair}" and not CFG["dry_run"])
+        free = max(0.0, gate.spot_balance(base) - bot_qty)  # 자동매매가 관리 중인 수량은 제외
+        ratio = 1.0 if (len(args) < 2 or args[1].lower() in ("all", "전부")) else float(args[1].rstrip("%")) / 100
+        qty = free * min(max(ratio, 0.0), 1.0)
+        if qty * last < 1:
+            notify(f"⛔ 팔 수 있는 {base} 이 없거나 너무 적습니다 (보유 {free:g})")
+            return
+        if qty * last > CFG["manual_max_usdt"] * 10:
+            notify(f"⛔ 한 번에 {CFG['manual_max_usdt'] * 10:g} USDT 넘게는 못 팝니다 — 비율을 낮춰 주세요")
+            return
+        desc = f"{pair} {qty:.8g} {base} 시장가 매도 (약 {qty * last:.2f} USDT)"
+        order = {"side": "sell", "pair": pair, "qty": qty}
+    import random
+    code = f"{random.SystemRandom().randint(0, 9999):04d}"
+    st["pending"] = dict(order, code=code, until=time.time() + 60)
+    notify(f"🧾 {desc}\n현재가 {last:g}\n확정: /confirm {code}  (60초 안에)   취소: /cancel")
+
+
+def confirm_manual(gate, st, code):
+    o = st.pop("pending", None)  # 코드가 틀려도 대기 주문은 취소 (코드 추측 방지)
+    if not o or o["code"] != code:
+        notify("❌ 확인 코드가 맞지 않거나 대기 중인 주문이 없습니다 — 주문을 다시 해 주세요")
+        return
+    if time.time() > o["until"]:
+        notify("⌛ 60초가 지나 취소됐습니다. 다시 주문해 주세요")
+        return
+    if not CFG["manual_trading"]:
+        notify("🔒 수동 매매가 꺼져 있습니다")
+        return
+    pair, base = o["pair"], o["pair"].split("_")[0]
+    if o["side"] == "buy":
+        if gate.spot_balance("USDT") < o["usdt"]:
+            notify("⛔ USDT 잔고 부족")
+            return
+        before = gate.spot_balance(base)
+        try:
+            r = gate.spot_market(pair, "buy", f"{o['usdt']:.2f}")
+        except Exception as e:
+            r = None
+            log(f"수동 매수 응답 오류 → 잔고 확인: {e}")
+            time.sleep(2)
+        got = gate.spot_balance(base) - before
+        if got <= 0:
+            notify(f"⚠️ {pair} 매수가 체결되지 않았습니다")
+            return
+        price = _f((r or {}).get("avg_deal_price")) or gate.spot_last(pair)
+        log_trade("manual", pair, "buy", price, None, "텔레그램")
+        notify(f"✅ [수동 매수] {pair} {got:.8g} {base} @ {price:g} ({o['usdt']:g} USDT)\n"
+               f"※ 자동 손절 없음 — 필요하면 /alert 로 가격 알림을 거세요")
+    else:
+        prec = int(gate.spot_pair(pair).get("amount_precision", 6))
+        qty = math.floor(o["qty"] * 10 ** prec) / 10 ** prec
+        before = gate.spot_balance(base)
+        try:
+            r = gate.spot_market(pair, "sell", f"{qty:.{prec}f}")
+        except Exception as e:
+            r = None
+            log(f"수동 매도 응답 오류 → 잔고 확인: {e}")
+            time.sleep(2)
+        if gate.spot_balance(base) > before - qty * 0.5:
+            notify(f"⚠️ {pair} 매도가 체결되지 않았습니다")
+            return
+        price = _f((r or {}).get("avg_deal_price")) or gate.spot_last(pair)
+        log_trade("manual", pair, "sell", price, None, "텔레그램")
+        notify(f"✅ [수동 매도] {pair} {qty:.8g} {base} @ {price:g} (약 {qty * price:.2f} USDT)")
 
 
 def maybe_daily_report(gate, st):
@@ -744,6 +951,7 @@ def main():
             elif not trading_halted(st):
                 halted_notified = False
             poll_telegram(gate, st)
+            check_alerts(gate, st)
             maybe_daily_report(gate, st)
         except Exception as e:
             notify_error(e)
