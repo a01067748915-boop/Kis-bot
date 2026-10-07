@@ -2,7 +2,8 @@
 # 보안 패치 한 번에 적용: bash secure_update.sh   (curl | bash 로 실행하지 말 것 — 질문에 답할 수 없음)
 #  1) 봇 정지 → 백업 → 최신 코드 받기 → setup.sh(권한·서비스 격리) → 점검 → 재시작
 #  2) 재시작 실패 시 자동으로 이전 버전 복구
-#  3) 서버 보안(자동 보안 업데이트, 방화벽, SSH 비밀번호 로그인 차단)은 하나씩 물어보고 적용
+#  3) 서버 보안(자동 보안 업데이트, 방화벽, SSH 비밀번호 로그인 차단, fail2ban)은 하나씩 물어보고 적용
+#  4) 마지막에 보안 상태 요약 (권한·방화벽·열린 포트·대기 중 업데이트)
 set -euo pipefail
 cd "$(dirname "$0")"
 DIR="$(pwd)"
@@ -10,6 +11,22 @@ BRANCH="${BRANCH:-claude/implementable-features-sq6aav}"
 BASE="https://raw.githubusercontent.com/a01067748915-boop/Kis-bot/${BRANCH}"
 FILES="bot.py kis_api.py signals.py report.py datacheck.py progress.sh minute_backtest.py news_backtest.py analysis.py fundamentals.py make_universe.py check.py backtest.py strategies.py setup.sh requirements.txt .env.example .gitignore"
 UNIT=/etc/systemd/system/kisbot.service
+SELF="${DIR}/$(basename "$0")"
+
+# ─── 0. 이 스크립트부터 최신으로 (예전 버전은 새 파일 목록을 몰라 일부 파일을 못 받음) ─
+if [ -z "${KISBOT_SELF_UPDATED:-}" ]; then
+  NEW="$(mktemp)"
+  if curl -fsSL "$BASE/secure_update.sh" -o "$NEW" && bash -n "$NEW"; then
+    if ! cmp -s "$NEW" "$SELF"; then
+      cp "$NEW" "$SELF"; rm -f "$NEW"
+      echo "▶ 업데이트 스크립트를 최신으로 바꿔 다시 시작합니다"
+      KISBOT_SELF_UPDATED=1 exec bash "$SELF" "$@"
+    fi
+  else
+    echo "⚠️ 최신 업데이트 스크립트를 받지 못해 지금 버전으로 진행합니다"
+  fi
+  rm -f "$NEW"
+fi
 BACKUP="${DIR}/backup/$(date +%Y%m%d-%H%M%S)"
 
 ask() {  # ask "질문" 기본값(y/n)
@@ -141,6 +158,34 @@ elif ask "   지금 SSH 키로 접속 중이 맞나요? 비밀번호 로그인�
     fi
   fi
 fi
+
+echo ""
+echo "④ 무차별 대입 공격 차단(fail2ban): SSH 로그인을 여러 번 틀린 IP 를 일정 시간 차단"
+if ask "   fail2ban 을 켤까요?" y; then
+  sudo apt-get install -y -qq fail2ban python3-systemd
+  printf '[sshd]\nenabled = true\nbackend = systemd\nmaxretry = 5\nfindtime = 10m\nbantime = 1h\n' \
+    | sudo tee /etc/fail2ban/jail.d/kisbot-sshd.local > /dev/null
+  if sudo systemctl enable --now fail2ban > /dev/null 2>&1 && sudo systemctl restart fail2ban; then
+    echo "   ✅ fail2ban 켜짐 (10분 안에 5번 틀리면 1시간 차단). 차단 현황: sudo fail2ban-client status sshd"
+  else
+    echo "   ⚠️ fail2ban 시작 실패 — 확인: sudo journalctl -u fail2ban -n 20"
+  fi
+fi
+
+# ─── 7. 보안 상태 요약 ───────────────────────────────
+echo ""
+echo "━━ 보안 상태 요약 ━━"
+echo "  .env 권한        : $(stat -c '%a' .env) (600 이어야 함)"
+echo "  봇 폴더 권한      : $(stat -c '%a' "$DIR") (700 이어야 함)"
+echo "  자동 보안 업데이트 : $(grep -q 'Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null && echo 켜짐 || echo 꺼짐)"
+echo "  방화벽(ufw)      : $( (sudo ufw status 2>/dev/null || echo 'Status: 없음') | head -1 | sed 's/Status: //')"
+echo "  fail2ban        : $(systemctl is-active --quiet fail2ban 2>/dev/null && echo 켜짐 || echo 꺼짐)"
+echo "  SSH 비밀번호 로그인: $( (sudo sshd -T 2>/dev/null || true) | awk '$1=="passwordauthentication"{print ($2=="no"?"차단됨":"허용")}' | grep . || echo 확인 불가)"
+echo "  스왑            : $(swapon --show --noheadings | awk '{print $1, $3}' | grep . || echo 없음)"
+PENDING=$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst' || true)
+echo "  설치 대기 업데이트 : ${PENDING}개 $( [ "${PENDING:-0}" -gt 0 ] && echo '→ sudo apt-get upgrade -y 로 설치 (재부팅 필요할 수 있음)')"
+echo "  외부에서 접속 가능한 포트:"
+(sudo ss -tlnH 2>/dev/null || true) | awk '{print $4}' | grep -vE '^(127\.|\[::1\]|::1)' | sed 's/^/    /' | sort -u || true
 
 echo ""
 echo "🎉 보안 패치 완료. 로그: tail -f ${DIR}/bot.log"

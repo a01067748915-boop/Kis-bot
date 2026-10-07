@@ -14,14 +14,15 @@ sudo apt-get install -y -qq python3-venv python3-pip
 
 echo "▶ 가상환경 & 패키지"
 python3 -m venv venv
-./venv/bin/pip install -q -r requirements.txt
+./venv/bin/pip install -q -U pip
+./venv/bin/pip install -q -U -r requirements.txt  # -U: 보안 수정된 최신 버전으로
 
 if [ ! -f .env ]; then
   cp .env.example .env
   echo "▶ .env 파일을 만들었습니다. 'nano .env'로 키를 입력하세요."
 fi
 chmod 600 .env
-chmod 600 .token_*.json state.json trades.csv bot.log* 2>/dev/null || true
+chmod 600 .token_*.json state.json trades.csv bot.log* .env.bak* 2>/dev/null || true
 chmod 700 "${DIR}"
 
 echo "▶ 자동 실행 서비스 등록"
