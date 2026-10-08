@@ -1,0 +1,62 @@
+# 섹터 균형 성장주 추가 36종목 — growth_balanced.txt 와 겹치지 않음
+# 선정 규칙: 각 섹터에서 성장성으로 알려진 거래량 많은 미국 대형·중형주, 과거 수익률은 보지 않음,
+#            이후 부진·폭락한 종목도 일부러 포함(MRNA, PLUG, NKE, ETSY, CLF, EL, CCI 등), 2020년 이전 상장 위주
+# 사용: strategies.py --only robust --targets @universes/growth_balanced.txt --add @universes/growth_extra.txt
+
+# 정보기술 (6)
+AMAT:NAS   # 어플라이드머티어리얼즈 — 반도체 장비
+MU:NAS     # 마이크론 — 메모리
+PANW:NAS   # 팔로알토 — 보안
+FTNT:NAS   # 포티넷 — 보안
+ANET:NYS   # 아리스타 — 네트워크
+INTU:NAS   # 인튜이트 — 세무·회계 소프트웨어
+
+# 커뮤니케이션 (3)
+SPOT:NYS   # 스포티파이 — 음악 스트리밍
+EA:NAS     # 일렉트로닉아츠 — 게임
+PINS:NYS   # 핀터레스트 — SNS
+
+# 경기소비재 (4)
+NKE:NYS    # 나이키 — 의류
+SBUX:NAS   # 스타벅스 — 외식
+DECK:NYS   # 데커스 — 신발(호카)
+ETSY:NAS   # 엣시 — 이커머스
+
+# 헬스케어 (4)
+ISRG:NAS   # 인튜이티브서지컬 — 수술 로봇
+MRNA:NAS   # 모더나 — 백신
+ALGN:NAS   # 얼라인 — 투명교정
+ZTS:NYS    # 조에티스 — 동물 의약품
+
+# 금융 (3)
+AXP:NYS    # 아메리칸익스프레스 — 카드
+BX:NYS     # 블랙스톤 — 대체투자
+ICE:NYS    # ICE — 거래소
+
+# 산업재 (4)
+GE:NYS     # GE — 항공엔진
+CAT:NYS    # 캐터필러 — 건설기계
+PWR:NYS    # 콴타 — 전력망 공사
+FAST:NAS   # 패스널 — 산업 유통
+
+# 에너지 (3)
+COP:NYS    # 코노코필립스 — 석유
+SLB:NYS    # 슐룸베르거 — 유전 서비스
+PLUG:NAS   # 플러그파워 — 수소
+
+# 소재 (3)
+SCCO:NYS   # 서던코퍼 — 구리
+STLD:NAS   # 스틸다이내믹스 — 철강
+CLF:NYS    # 클리블랜드클리프스 — 철강
+
+# 필수소비재 (2)
+EL:NYS     # 에스티로더 — 화장품
+STZ:NYS    # 컨스텔레이션브랜즈 — 주류
+
+# 유틸리티 (2)
+AES:NYS    # AES — 재생에너지 전력
+NRG:NYS    # NRG — 전력
+
+# 부동산 (2)
+DLR:NYS    # 디지털리얼티 — 데이터센터
+CCI:NYS    # 크라운캐슬 — 통신탑

@@ -1,0 +1,4 @@
+# 직접 고른 관심 종목 — 아직 덜 올랐다고 보는 성장주
+# 사용: strategies/analysis 의 --add 에 함께, 또는 TARGETS=@universes/...,@universes/my_picks.txt
+JOBY:NYS   # 조비 에비에이션 — 전기 수직이착륙 에어택시 (2021년 상장, 상용화 전)
+ACHR:NYS   # 아처 에비에이션 — 전기 수직이착륙 에어택시 (2021년 상장, 상용화 전)
