@@ -122,8 +122,8 @@ def test_redact_hides_token_key_and_bot_urls(gb):
 
 
 def test_same_error_is_notified_once_per_30min(gb):
-    gb.notify_error("GET /spot/tickers 503")
-    gb.notify_error("GET /spot/tickers 503")
+    gb.notify_error("GET /spot/tickers 400: INVALID_CURRENCY")
+    gb.notify_error("GET /spot/tickers 400: INVALID_CURRENCY")
     assert len(gb.sent) == 1
 
 
@@ -468,3 +468,69 @@ def test_top_has_analyze_buttons(gb):
     gb.handle_command(g, gb.load_state(), "/top")
     flat = [d for row in gb.buttons[-1] for _, d in row]
     assert "an:C19_USDT" in flat and all(d.startswith("an:") for d in flat)
+
+
+HTML_502 = "<html>\n<head><title>502 Bad Gateway</title></head>\n<body>\n<center><h1>502 Bad Gateway</h1></center>\n</body>\n</html>"
+
+
+class R2:
+    def __init__(self, code, text):
+        self.status_code, self.text = code, text
+
+    def json(self):
+        import json
+        return json.loads(self.text)
+
+
+def test_get_retries_on_502_then_succeeds(gb):
+    calls = []
+
+    class S:
+        def request(self, method, url, **k):
+            calls.append(method)
+            return R2(502, HTML_502) if len(calls) < 3 else R2(200, '[{"last": "1.5"}]')
+    g = gb.Gate("k", "s")
+    g.s = S()
+    assert g.spot_last("XRP_USDT") == 1.5 and len(calls) == 3
+
+
+def test_post_is_not_retried_and_html_is_cleaned(gb):
+    calls = []
+
+    class S:
+        def request(self, method, url, **k):
+            calls.append(method)
+            return R2(502, HTML_502)
+    g = gb.Gate("k", "s")
+    g.s = S()
+    with pytest.raises(RuntimeError) as e:
+        g.spot_market("XRP_USDT", "buy", "5")
+    assert calls == ["POST"]  # 주문은 한 번만
+    assert "<html>" not in str(e.value) and "502 Bad Gateway" in str(e.value)
+
+
+def test_outage_alert_only_after_10min_and_recovery(gb, monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(gb.time, "time", lambda: now[0])
+    gb._outage.update(since=0.0, count=0, alerted=False)
+    err = "GET /spot/tickers 502: 502 Bad Gateway"
+    assert gb.notify_error(err) is True
+    now[0] += 300
+    gb.notify_error(err)
+    assert gb.sent == []                       # 5분째: 알림 없음
+    now[0] += 301
+    gb.notify_error(err)
+    assert len(gb.sent) == 1 and "10분째" in gb.sent[0]
+    gb.notify_error(err)
+    assert len(gb.sent) == 1                   # 한 번만
+    gb.outage_check(True)
+    assert "복구" in gb.sent[-1] and gb._outage["since"] == 0.0
+    gb.outage_check(True)
+    assert len(gb.sent) == 2                   # 복구 알림도 한 번만
+
+
+def test_short_outage_is_silent(gb, monkeypatch):
+    gb._outage.update(since=0.0, count=0, alerted=False)
+    gb.notify_error("GET /spot/tickers 연결 실패: ReadTimeout")
+    gb.outage_check(True)
+    assert gb.sent == []

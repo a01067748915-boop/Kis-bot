@@ -129,16 +129,44 @@ def notify(msg, buttons=None):
 
 
 _err_seen = {}
+_outage = {"since": 0.0, "count": 0, "alerted": False}
+TRANSIENT = re.compile(r"\b(5\d\d|429)\b|연결 실패|timed? ?out|Timeout|Bad Gateway|Service Unavailable", re.I)
+
+
+def clean_text(text):
+    """HTML 오류 페이지 → 짧은 글자 (502 Bad Gateway 등)"""
+    text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", str(text), flags=re.S | re.I)
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text)).strip()
+
+
+def outage_check(ok):
+    """거래소 일시 장애는 10분 넘게 이어질 때만 알림, 복구되면 한 번 알림"""
+    if ok:
+        if _outage["alerted"]:
+            mins = (time.time() - _outage["since"]) / 60
+            notify(f"✅ Gate.io 연결 복구 ({mins:.0f}분, 오류 {_outage['count']}회 — 그동안 봇은 계속 재시도)")
+        _outage.update(since=0.0, count=0, alerted=False)
 
 
 def notify_error(e):
-    """같은 오류는 30분에 한 번만 텔레그램으로 (거래소 장애 때 알림 폭탄 방지). 로그에는 매번 남김"""
-    key = redact(e)[:120]
+    """같은 오류는 30분에 한 번만 텔레그램으로 (거래소 장애 때 알림 폭탄 방지). 로그에는 매번 남김
+    502·타임아웃 같은 거래소 일시 장애는 10분 넘게 계속될 때만 알림"""
     now = time.time()
+    if TRANSIENT.search(str(e)):
+        log(f"⚠️ 거래소 일시 오류(재시도 중): {e}")
+        if not _outage["since"]:
+            _outage["since"] = now
+        _outage["count"] += 1
+        if not _outage["alerted"] and now - _outage["since"] >= 600:
+            _outage["alerted"] = True
+            notify(f"⚠️ Gate.io 서버 응답 불안정 10분째 ({clean_text(redact(e))[:120]})\n"
+                   f"봇은 계속 재시도 중 — 복구되면 다시 알려드려요. 거래소 공지도 확인해 보세요")
+        return True
+    key = redact(e)[:120]
     last, skipped = _err_seen.get(key, (0, 0))
     if now - last >= 1800:
         extra = f" (30분 동안 같은 오류 {skipped}회 더 발생)" if skipped else ""
-        notify(f"⚠️ 오류: {redact(e)[:300]}{extra}")
+        notify(f"⚠️ 오류: {clean_text(redact(e))[:300]}{extra}")
         _err_seen[key] = (now, 0)
     else:
         log(f"⚠️ 오류(알림 생략): {e}")
@@ -180,10 +208,23 @@ class Gate:
         if private:
             headers.update(self._sign(method, path, query, body_str))
         url = f"{BASE_URL}{PREFIX}{path}" + (f"?{query}" if query else "")
-        r = self.s.request(method, url, headers=headers, data=body_str or None, timeout=15)
-        if r.status_code >= 400:
-            raise RuntimeError(f"{method} {path} {r.status_code}: {r.text[:300]}")
-        return r.json() if r.text else None
+        tries = 3 if method == "GET" else 1  # 조회만 재시도 (주문은 중복 체결 위험 → 체결 여부를 따로 확인)
+        for attempt in range(tries):
+            if private and attempt:
+                headers.update(self._sign(method, path, query, body_str))  # 서명 시각 갱신
+            try:
+                r = self.s.request(method, url, headers=headers, data=body_str or None, timeout=15)
+            except requests.RequestException as e:
+                if attempt + 1 < tries:
+                    time.sleep(1 + attempt * 2)
+                    continue
+                raise RuntimeError(f"{method} {path} 연결 실패: {type(e).__name__}") from None
+            if (r.status_code >= 500 or r.status_code == 429) and attempt + 1 < tries:
+                time.sleep(1 + attempt * 2)  # 거래소 일시 장애(502 등) → 잠깐 뒤 다시
+                continue
+            if r.status_code >= 400:
+                raise RuntimeError(f"{method} {path} {r.status_code}: {clean_text(r.text)[:200]}")
+            return r.json() if r.text else None
 
     # 현물
     def spot_candles(self, pair, interval, limit=200):
@@ -1135,14 +1176,17 @@ def main():
         notify_error(e)
     halted_notified = False
     while True:
+        had_outage = False
         for market, syms, fn in (("spot", CFG["spot_symbols"], run_spot),
                                  ("fut", CFG["futures_symbols"], run_futures)):
             for sym in syms:
                 try:  # 한 종목 오류가 다른 종목 관리(손절 등)를 막지 않게
                     fn(gate, st, sym)
                 except Exception as e:
-                    notify_error(f"{market}:{sym} {e}")
-                    log(traceback.format_exc())
+                    if notify_error(f"{market}:{sym} {e}"):
+                        had_outage = True
+                    else:
+                        log(traceback.format_exc())
         try:
             if trading_halted(st) and not halted_notified:
                 notify(f"⛔ 일일 손실 한도({CFG['daily_loss_limit_usdt']} USDT) 도달 — 오늘은 신규 진입 중단")
@@ -1153,7 +1197,8 @@ def main():
             check_alerts(gate, st)
             maybe_daily_report(gate, st)
         except Exception as e:
-            notify_error(e)
+            had_outage = bool(notify_error(e)) or had_outage
+        outage_check(not had_outage)
         save_state(st)
         time.sleep(CFG["loop_sec"])
 
