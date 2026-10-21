@@ -1,0 +1,66 @@
+# 섹터 균형 성장주 39종목 — GICS 11개 섹터에서 섹터마다 2~4개
+# 선정 규칙: 각 섹터에서 성장성(매출 성장·신사업)으로 알려진 거래량 많은 미국 대형·중형주,
+#            과거 수익률은 보지 않음, 2020년 이전 상장 위주(10년 백테스트 가능), ETF 제외
+# 형식: 종목:거래소(NAS=나스닥, NYS=뉴욕증권거래소)  — 쉼표나 줄바꿈으로 구분, # 뒤는 설명
+# 사용: TARGETS=@universes/growth_balanced.txt  /  strategies.py --targets @universes/growth_balanced.txt
+
+# 정보기술 (4)
+NVDA:NAS   # 엔비디아 — AI 반도체
+AMD:NAS    # AMD — CPU·GPU
+CRM:NYS    # 세일즈포스 — 클라우드 소프트웨어
+ADBE:NAS   # 어도비 — 크리에이티브 소프트웨어
+
+# 커뮤니케이션 (4)
+GOOGL:NAS  # 알파벳 — 검색·클라우드
+META:NAS   # 메타 — SNS·광고
+NFLX:NAS   # 넷플릭스 — 스트리밍
+TTWO:NAS   # 테이크투 — 게임
+
+# 경기소비재 (4)
+AMZN:NAS   # 아마존 — 이커머스·클라우드
+TSLA:NAS   # 테슬라 — 전기차
+CMG:NYS    # 치폴레 — 외식 성장
+LULU:NAS   # 룰루레몬 — 의류
+
+# 헬스케어 (4)
+VRTX:NAS   # 버텍스 — 바이오
+DXCM:NAS   # 덱스콤 — 혈당측정기
+BSX:NYS    # 보스턴사이언티픽 — 의료기기
+EW:NYS     # 에드워즈 — 심장 의료기기
+
+# 금융 (4)
+V:NYS      # 비자 — 결제망
+PYPL:NAS   # 페이팔 — 온라인 결제
+SCHW:NYS   # 찰스슈왑 — 증권
+KKR:NYS    # KKR — 대체투자
+
+# 산업재 (4)
+UBER:NYS   # 우버 — 모빌리티·배달
+ODFL:NAS   # 올드도미니언 — 화물운송
+CPRT:NAS   # 코파트 — 중고차 경매 플랫폼
+ETN:NYS    # 이튼 — 전력 설비
+
+# 에너지 (4)
+FSLR:NAS   # 퍼스트솔라 — 태양광
+ENPH:NAS   # 엔페이즈 — 태양광 인버터
+OXY:NYS    # 옥시덴탈 — 석유
+HAL:NYS    # 할리버튼 — 유전 서비스
+
+# 소재 (3)
+FCX:NYS    # 프리포트 — 구리
+ALB:NYS    # 앨버말 — 리튬
+NUE:NYS    # 뉴코어 — 철강
+
+# 필수소비재 (3)
+MNST:NAS   # 몬스터 — 에너지음료
+CELH:NAS   # 셀시어스 — 에너지음료
+ELF:NYS    # e.l.f. — 화장품
+
+# 유틸리티 (3)
+NEE:NYS    # 넥스트에라 — 재생에너지 전력
+VST:NYS    # 비스트라 — 전력 생산
+CEG:NAS    # 컨스텔레이션 — 원자력 (2022년 분사, 이후 참여)
+
+# 부동산 (2)
+PLD:NYS    # 프로로지스 — 물류창고
+AMT:NYS    # 아메리칸타워 — 통신탑
